@@ -110,6 +110,7 @@ static unsigned long col_focus  = COL_FOCUS;
 static char autostart_cmds[1024];
 static char bg_image[512];      /* wallpaper path; screen-fixed */
 static char locker_cmd[256] = "i3lock -c 000000 || slock || xsecurelock";
+static char battery_name[64];   /* /sys/class/power_supply entry; ""=auto */
 
 typedef struct Client {
     Window win;
@@ -306,7 +307,12 @@ static const char *config_default =
     "\n"
     "# screen locker command (Super+L). i3lock recommended:\n"
     "#   sudo apt install i3lock\n"
-    "locker: \"i3lock -c 000000 || slock || xsecurelock\"\n";
+    "locker: \"i3lock -c 000000 || slock || xsecurelock\"\n"
+    "\n"
+    "# battery shown in the Super+M panel: a name from\n"
+    "# /sys/class/power_supply (e.g. BAT0, BAT1).\n"
+    "# Empty = auto-detect the first battery.\n"
+    "battery: \"\"\n";
 
 static void load_config(void) {
     char path[512], line[1280];
@@ -360,6 +366,8 @@ static void load_config(void) {
         }
         if (!strcmp(key, "autostart"))
             snprintf(autostart_cmds, sizeof autostart_cmds, "%s", val);
+        else if (!strcmp(key, "battery"))
+            snprintf(battery_name, sizeof battery_name, "%s", val);
         else if (!strcmp(key, "locker") && *val)
             snprintf(locker_cmd, sizeof locker_cmd, "%s", val);
         else if (!strcmp(key, "background_image"))
@@ -1342,6 +1350,61 @@ static int tm_is_listed(Client *c) {
 }
 
 /* total cpu%% (/proc/stat) and ram%% (/proc/meminfo), once per second */
+/* battery: /sys/class/power_supply/<name>/{capacity,status}. The name
+ * comes from the config ("battery:"), or the first type==Battery entry. */
+static int bat_pct = -1;        /* -1: none found / unreadable */
+static int bat_charging;
+static char bat_auto[64];       /* cached auto-detected name */
+
+static void sample_battery(void) {
+    char path[160], buf[64];
+    const char *name = battery_name[0] ? battery_name : bat_auto;
+    FILE *f;
+    bat_pct = -1;
+    bat_charging = 0;
+    if (!name[0]) {
+        DIR *d = opendir("/sys/class/power_supply");
+        struct dirent *e;
+        if (d) {
+            while ((e = readdir(d))) {
+                if (e->d_name[0] == '.') continue;
+                snprintf(path, sizeof path,
+                         "/sys/class/power_supply/%s/type", e->d_name);
+                f = fopen(path, "r");
+                if (!f) continue;
+                buf[0] = 0;
+                if (!fgets(buf, sizeof buf, f)) buf[0] = 0;
+                fclose(f);
+                if (!strncmp(buf, "Battery", 7)) {
+                    snprintf(bat_auto, sizeof bat_auto, "%s", e->d_name);
+                    break;
+                }
+            }
+            closedir(d);
+        }
+        name = bat_auto;
+        if (!name[0]) return;
+    }
+    snprintf(path, sizeof path, "/sys/class/power_supply/%s/capacity", name);
+    f = fopen(path, "r");
+    if (f) {
+        if (fgets(buf, sizeof buf, f)) bat_pct = atoi(buf);
+        fclose(f);
+    } else if (!battery_name[0]) {
+        bat_auto[0] = 0;        /* battery vanished: re-detect next time */
+        return;
+    }
+    if (bat_pct > 100) bat_pct = 100;
+    snprintf(path, sizeof path, "/sys/class/power_supply/%s/status", name);
+    f = fopen(path, "r");
+    if (f) {
+        if (fgets(buf, sizeof buf, f) &&
+            (!strncmp(buf, "Charging", 8) || !strncmp(buf, "Full", 4)))
+            bat_charging = 1;
+        fclose(f);
+    }
+}
+
 static void sample_system(void) {
     FILE *f;
     char buf[256];
@@ -1383,6 +1446,7 @@ static void sample_system(void) {
     hist_cpu[hist_len] = cpu;
     hist_ram[hist_len] = ram;
     hist_len++;
+    sample_battery();
     sys_sampled = now_s();
 }
 
@@ -1488,6 +1552,22 @@ static void draw_tm(void) {
             snprintf(buf, sizeof buf, "RAM %.0f%%", hist_ram[hist_len - 1]);
             XSetForeground(dpy, tmgc, 0xff5f57);
             XDrawString(dpy, tmwin, tmgc, gx + 96, gy + 14, buf,
+                        (int)strlen(buf));
+        }
+        /* battery: green while charging/full, red when low, grey idle.
+         * "BAT --" if the configured battery can't be read. */
+        if (bat_pct >= 0 || battery_name[0]) {
+            if (bat_pct >= 0)
+                snprintf(buf, sizeof buf, "%s %d%%%s",
+                         battery_name[0] ? battery_name : "BAT", bat_pct,
+                         bat_charging ? "+" : "");
+            else
+                snprintf(buf, sizeof buf, "%s --", battery_name);
+            XSetForeground(dpy, tmgc,
+                           bat_charging                  ? 0x28c840 :
+                           bat_pct >= 0 && bat_pct <= 15 ? 0xff5f57 :
+                                                           0xc8c8c8);
+            XDrawString(dpy, tmwin, tmgc, gx + 186, gy + 14, buf,
                         (int)strlen(buf));
         }
     }
@@ -1903,6 +1983,13 @@ static void handle_event(XEvent *ev) {
         if (c) {
             c->mapped = 1;
             free_pict(c);
+            if (c->is_or) {
+                /* apps reuse menu/tooltip windows: on re-map, put the
+                 * client back on top of the PAINT order too, or the menu
+                 * renders behind windows raised since its first map */
+                detach(c);
+                attach_top(c);
+            }
             if (c->frame && !c->fullscreen) {
                 XMapWindow(dpy, c->frame);
                 restack_frame(c);

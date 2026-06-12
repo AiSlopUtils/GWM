@@ -102,6 +102,10 @@ focus_color: "#4a90e2"
 # wallpaper (png/jpg). Scaled to cover the screen and screen-FIXED:
 # windows pan and zoom over it, the background never moves.
 background_image: "~/Pictures/wall.png"
+
+# battery shown in the Mod+M panel: a name from /sys/class/power_supply
+# (e.g. BAT0, BAT1). Empty = auto-detect the first battery.
+battery: "BAT0"
 ```
 
 Wallpaper support needs Imlib2 at build time (`sudo apt install
