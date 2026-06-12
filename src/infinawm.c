@@ -52,6 +52,12 @@
 #if HAVE_IMLIB2
 #include <Imlib2.h>
 #endif
+#ifndef HAVE_XINERAMA
+#define HAVE_XINERAMA 0
+#endif
+#if HAVE_XINERAMA
+#include <X11/extensions/Xinerama.h>
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -402,7 +408,58 @@ static XRenderColor rcol(unsigned long c) {
 static double w2sx(double wx_) { return (wx_ - vx) * zoom; }
 static double w2sy(double wy_) { return (wy_ - vy) * zoom; }
 static double s2wx(double sx_) { return vx + sx_ / zoom; }
-static double s2wy(double sy_) { return vy + sy_ / zoom; }
+
+/* ---- monitors --------------------------------------------------------- */
+#define MON_MAX 16
+typedef struct { int x, y, w, h; } Mon;
+static Mon mons[MON_MAX];
+static int nmons;
+
+static void update_monitors(void) {
+    nmons = 0;
+#if HAVE_XINERAMA
+    {
+        int n = 0, i;
+        XineramaScreenInfo *si;
+        if (XineramaIsActive(dpy) && (si = XineramaQueryScreens(dpy, &n))) {
+            for (i = 0; i < n && i < MON_MAX; i++) {
+                mons[nmons].x = si[i].x_org;
+                mons[nmons].y = si[i].y_org;
+                mons[nmons].w = si[i].width;
+                mons[nmons].h = si[i].height;
+                nmons++;
+            }
+            XFree(si);
+        }
+    }
+#endif
+    if (!nmons) {       /* no Xinerama: one monitor spanning the screen */
+        mons[0].x = 0; mons[0].y = 0; mons[0].w = SW; mons[0].h = SH;
+        nmons = 1;
+    }
+}
+
+/* the monitor containing a screen point, or the nearest one */
+static Mon *monitor_at(double sx_, double sy_) {
+    int i, best = 0;
+    double bd = -1.0;
+    for (i = 0; i < nmons; i++) {
+        double dx = sx_ < mons[i].x ? mons[i].x - sx_ :
+                    sx_ >= mons[i].x + mons[i].w ?
+                        sx_ - (mons[i].x + mons[i].w - 1) : 0.0;
+        double dy = sy_ < mons[i].y ? mons[i].y - sy_ :
+                    sy_ >= mons[i].y + mons[i].h ?
+                        sy_ - (mons[i].y + mons[i].h - 1) : 0.0;
+        double d = dx * dx + dy * dy;
+        if (bd < 0 || d < bd) { bd = d; best = i; }
+    }
+    return &mons[best];
+}
+
+/* the monitor a window is (mostly) on, by its rendered center */
+static Mon *monitor_of(Client *c) {
+    return monitor_at(w2sx(c->x + c->w / 2.0), w2sy(c->y + c->h / 2.0));
+}
 
 /* ---- client helpers -------------------------------------------------- */
 static Client *find_client(Window w) {
@@ -621,8 +678,12 @@ static int step_animation(void) {
 static void set_fullscreen(Client *c, int on);
 
 static void snap_client(Client *c, Snap mode) {
-    double vw = SW / tzoom, vh = SH / tzoom;
+    double vw, vh, mx, my;
+    Mon *m;
     if (!c || c->is_or || c->screenspace) return;
+    m = monitor_of(c);          /* snap on the window's own monitor */
+    vw = m->w / tzoom; vh = m->h / tzoom;
+    mx = tvx + m->x / tzoom; my = tvy + m->y / tzoom;
     if (c->fullscreen) set_fullscreen(c, 0);
     if (mode == SNAP_FULL && c->snapped == SNAP_FULL) mode = SNAP_NONE;
     if (mode == SNAP_NONE) {
@@ -633,13 +694,13 @@ static void snap_client(Client *c, Snap mode) {
     } else {
         if (!c->snapped) { c->sx = c->x; c->sy = c->y; c->sw = c->w; c->sh = c->h; }
         switch (mode) {   /* leave room for the title bar */
-        case SNAP_L:    c->x = tvx;          c->y = tvy + TBAR; c->w = vw / 2; c->h = vh - TBAR; break;
-        case SNAP_R:    c->x = tvx + vw / 2; c->y = tvy + TBAR; c->w = vw / 2; c->h = vh - TBAR; break;
-        case SNAP_FULL: c->x = tvx;          c->y = tvy + TBAR; c->w = vw;     c->h = vh - TBAR; break;
-        case SNAP_TL:   c->x = tvx;          c->y = tvy + TBAR;          c->w = vw / 2; c->h = vh / 2 - TBAR; break;
-        case SNAP_TR:   c->x = tvx + vw / 2; c->y = tvy + TBAR;          c->w = vw / 2; c->h = vh / 2 - TBAR; break;
-        case SNAP_BL:   c->x = tvx;          c->y = tvy + vh / 2 + TBAR; c->w = vw / 2; c->h = vh / 2 - TBAR; break;
-        case SNAP_BR:   c->x = tvx + vw / 2; c->y = tvy + vh / 2 + TBAR; c->w = vw / 2; c->h = vh / 2 - TBAR; break;
+        case SNAP_L:    c->x = mx;          c->y = my + TBAR; c->w = vw / 2; c->h = vh - TBAR; break;
+        case SNAP_R:    c->x = mx + vw / 2; c->y = my + TBAR; c->w = vw / 2; c->h = vh - TBAR; break;
+        case SNAP_FULL: c->x = mx;          c->y = my + TBAR; c->w = vw;     c->h = vh - TBAR; break;
+        case SNAP_TL:   c->x = mx;          c->y = my + TBAR;          c->w = vw / 2; c->h = vh / 2 - TBAR; break;
+        case SNAP_TR:   c->x = mx + vw / 2; c->y = my + TBAR;          c->w = vw / 2; c->h = vh / 2 - TBAR; break;
+        case SNAP_BL:   c->x = mx;          c->y = my + vh / 2 + TBAR; c->w = vw / 2; c->h = vh / 2 - TBAR; break;
+        case SNAP_BR:   c->x = mx + vw / 2; c->y = my + vh / 2 + TBAR; c->w = vw / 2; c->h = vh / 2 - TBAR; break;
         default: break;
         }
         c->snapped = mode;
@@ -656,9 +717,10 @@ static void send_configure(Client *c);
 static void set_fullscreen(Client *c, int on) {
     if (!c || c->is_or || c->screenspace || c->fullscreen == !!on) return;
     if (on) {
+        Mon *m = monitor_of(c);     /* fullscreen on the window's monitor */
         c->fsx = c->x; c->fsy = c->y; c->fsw = c->w; c->fsh = c->h;
-        c->x = tvx; c->y = tvy;
-        c->w = SW / tzoom; c->h = SH / tzoom;
+        c->x = tvx + m->x / tzoom; c->y = tvy + m->y / tzoom;
+        c->w = m->w / tzoom; c->h = m->h / tzoom;
         c->fullscreen = 1;
         if (c->frame) XUnmapWindow(dpy, c->frame);
         XChangeProperty(dpy, c->win, A_NET_WM_STATE, XA_ATOM, 32,
@@ -947,6 +1009,7 @@ static void load_wallpaper(void) {
         XImage *img;
         XTransform t;
         double s;
+        int mi;
 
         if (bg_image[0] == '~' && bg_image[1] == '/' && getenv("HOME"))
             snprintf(path, sizeof path, "%s/%s", getenv("HOME"), bg_image + 2);
@@ -987,18 +1050,6 @@ static void load_wallpaper(void) {
         XFreeGC(dpy, g32);
         spict = XRenderCreatePicture(dpy, spm, fmt_argb, 0, NULL);
 
-        /* scale to cover, centered (crop the overflow axis) */
-        s = (double)SW / iw;
-        if ((double)SH / ih > s) s = (double)SH / ih;
-        memset(&t, 0, sizeof t);
-        t.matrix[0][0] = XDoubleToFixed(1.0 / s);
-        t.matrix[1][1] = XDoubleToFixed(1.0 / s);
-        t.matrix[0][2] = XDoubleToFixed((iw - SW / s) / 2.0);
-        t.matrix[1][2] = XDoubleToFixed((ih - SH / s) / 2.0);
-        t.matrix[2][2] = XDoubleToFixed(1.0);
-        XRenderSetPictureTransform(dpy, spict, &t);
-        XRenderSetPictureFilter(dpy, spict, FilterBilinear, NULL, 0);
-
         bgpm = XCreatePixmap(dpy, root, (unsigned)SW, (unsigned)SH,
                              (unsigned)depth);
         bgpict = XRenderCreatePicture(dpy, bgpm, fmt_rgb, 0, NULL);
@@ -1007,8 +1058,24 @@ static void load_wallpaper(void) {
             XRenderFillRectangle(dpy, PictOpSrc, bgpict, &bgc, 0, 0,
                                  (unsigned)SW, (unsigned)SH);
         }
-        XRenderComposite(dpy, PictOpOver, spict, None, bgpict,
-                         0, 0, 0, 0, 0, 0, (unsigned)SW, (unsigned)SH);
+        /* duplicate the wallpaper on every monitor: scale to cover each
+         * monitor's rect, centered (crop the overflow axis) */
+        for (mi = 0; mi < nmons; mi++) {
+            Mon *m = &mons[mi];
+            s = (double)m->w / iw;
+            if ((double)m->h / ih > s) s = (double)m->h / ih;
+            memset(&t, 0, sizeof t);
+            t.matrix[0][0] = XDoubleToFixed(1.0 / s);
+            t.matrix[1][1] = XDoubleToFixed(1.0 / s);
+            t.matrix[0][2] = XDoubleToFixed((iw - m->w / s) / 2.0);
+            t.matrix[1][2] = XDoubleToFixed((ih - m->h / s) / 2.0);
+            t.matrix[2][2] = XDoubleToFixed(1.0);
+            XRenderSetPictureTransform(dpy, spict, &t);
+            XRenderSetPictureFilter(dpy, spict, FilterBilinear, NULL, 0);
+            XRenderComposite(dpy, PictOpOver, spict, None, bgpict,
+                             0, 0, 0, 0, m->x, m->y,
+                             (unsigned)m->w, (unsigned)m->h);
+        }
         XRenderFreePicture(dpy, spict);
         XFreePixmap(dpy, spm);
     }
@@ -1408,7 +1475,7 @@ static char bat_auto[64];       /* cached auto-detected name */
 static double bat_sampled;
 
 static void sample_battery(void) {
-    char path[160], buf[64];
+    char path[320], buf[64];    /* fits any 255-char sysfs entry name */
     const char *name = battery_name[0] ? battery_name : bat_auto;
     FILE *f;
     /* battery sysfs reads go through the EC and can block for tens of
@@ -1431,7 +1498,7 @@ static void sample_battery(void) {
                 if (!fgets(buf, sizeof buf, f)) buf[0] = 0;
                 fclose(f);
                 if (!strncmp(buf, "Battery", 7)) {
-                    snprintf(bat_auto, sizeof bat_auto, "%s", e->d_name);
+                    snprintf(bat_auto, sizeof bat_auto, "%.63s", e->d_name);
                     break;
                 }
             }
@@ -1535,8 +1602,10 @@ static void sample_system(void) {
             net = (double)(tot - net_prev) / dt;
         net_prev = tot;
     }
-    if (cpu < 0) cpu = 0; if (cpu > 100) cpu = 100;
-    if (ram < 0) ram = 0; if (ram > 100) ram = 100;
+    if (cpu < 0) cpu = 0;
+    if (cpu > 100) cpu = 100;
+    if (ram < 0) ram = 0;
+    if (ram > 100) ram = 100;
     if (hist_len == HIST_MAX) {
         memmove(hist_cpu, hist_cpu + 1, (HIST_MAX - 1) * sizeof(double));
         memmove(hist_ram, hist_ram + 1, (HIST_MAX - 1) * sizeof(double));
@@ -2193,6 +2262,7 @@ static void handle_event(XEvent *ev) {
         XConfigureEvent *ce = &ev->xconfigure;
         if (ce->window == root) {
             SW = ce->width; SH = ce->height;
+            update_monitors();
             make_backbuffer();
             load_wallpaper();   /* re-scale to the new resolution */
             dirty = 1;
@@ -2401,6 +2471,7 @@ int main(void) {
     XGetWindowAttributes(dpy, root, &rwa);
     pa.subwindow_mode = IncludeInferiors;
     rootpict = XRenderCreatePicture(dpy, root, fmt_rgb, CPSubwindowMode, &pa);
+    update_monitors();
     make_backbuffer();
     load_wallpaper();
 

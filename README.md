@@ -14,7 +14,8 @@ window decorations and animates pan/zoom transitions smoothly.
 
 ```sh
 sudo apt install build-essential libx11-dev libxext-dev libxrender-dev \
-                 libxcomposite-dev libxdamage-dev libxfixes-dev
+                 libxcomposite-dev libxdamage-dev libxfixes-dev \
+                 libxinerama-dev
 make
 sudo make install        # installs /usr/local/bin/gwm
 ```
@@ -142,6 +143,10 @@ Makefile            auto-detects dev headers, falls back to vendor/
 vendor/             minimal X11 extension headers for header-less builds
 ```
 
-Known limitations: multiple monitors are treated as one large canvas viewport
-rather than separate screens, and windows that set minimum size hints can
-still be resized smaller (apps clamp themselves when they care).
+Multi-monitor: the canvas pans and zooms as one large viewport spanning all
+monitors, but snapping, `Mod+F` maximize, and fullscreen target the monitor
+the window is on, and the wallpaper is duplicated per monitor (needs
+`libxinerama-dev` at build time; without it everything spans).
+
+Known limitations: windows that set minimum size hints can still be resized
+smaller (apps clamp themselves when they care).

@@ -10,6 +10,7 @@ HAVE_XCOMP_H := $(shell test -f /usr/include/X11/extensions/Xcomposite.h && echo
 HAVE_DAMAGE  := $(shell test -f /usr/include/X11/extensions/Xdamage.h && echo 1 || echo 0)
 HAVE_XTEST_H := $(shell test -f /usr/include/X11/extensions/XTest.h && echo 1 || echo 0)
 HAVE_IMLIB2  := $(shell test -f /usr/include/Imlib2.h && echo 1 || echo 0)
+HAVE_XINERAMA := $(shell test -f /usr/include/X11/extensions/Xinerama.h && echo 1 || echo 0)
 
 INC :=
 ifeq ($(HAVE_XCOMP_H),0)
@@ -33,13 +34,14 @@ LIB_XREND  := $(call findlib,Xrender)
 LIB_XTST   := $(call findlib,Xtst)
 LIB_XDAM   := $(if $(filter 1,$(HAVE_DAMAGE)),$(call findlib,Xdamage),)
 LIB_IMLIB  := $(if $(filter 1,$(HAVE_IMLIB2)),$(call findlib,Imlib2),)
+LIB_XIN    := $(if $(filter 1,$(HAVE_XINERAMA)),$(call findlib,Xinerama),)
 
 all: gwm
 
 gwm: src/infinawm.c
 	$(CC) $(CFLAGS) $(INC) -DHAVE_DAMAGE=$(HAVE_DAMAGE) \
-	  -DHAVE_IMLIB2=$(HAVE_IMLIB2) -o $@ $< \
-	  -lX11 $(LIB_XREND) $(LIB_XCOMP) $(LIB_XDAM) $(LIB_IMLIB) -lm
+	  -DHAVE_IMLIB2=$(HAVE_IMLIB2) -DHAVE_XINERAMA=$(HAVE_XINERAMA) -o $@ $< \
+	  -lX11 $(LIB_XREND) $(LIB_XCOMP) $(LIB_XDAM) $(LIB_IMLIB) $(LIB_XIN) -lm
 
 tools: xdo demoapp
 
