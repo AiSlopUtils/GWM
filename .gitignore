@@ -1,0 +1,17 @@
+# build outputs
+gwm
+infinawm
+xdo
+demoapp
+*.o
+
+# local dev / packaging junk — not part of the repo
+*.zip
+vm/
+test/
+tools/
+install.txt
+infinawm.desktop
+make-zip.sh
+/tmp/
+shots/
