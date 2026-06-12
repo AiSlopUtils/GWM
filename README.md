@@ -58,7 +58,7 @@ Mod = Super (the Windows key).
 | `Mod+scroll wheel` | zoom at the cursor |
 | `Mod+0` | reset zoom to 100% |
 | `Mod+R` | launcher — type a command, `Tab` completes, `Enter` runs |
-| `Mod+M` | task manager — open windows with icon, name, RAM and CPU; double-click a row to jump to that window. System tray icons dock in a row at the bottom |
+| `Mod+M` | task manager — system graph (CPU purple, RAM red, disk green, network blue) plus open windows with icon, name, RAM and CPU, heaviest RAM users first; double-click a row to jump to that window. System tray icons dock in a row at the bottom |
 | `Mod+Enter` | spawn a terminal |
 | `Mod+Shift+Left/Right` | snap focused window to left / right half |
 | `Mod+Shift+Up` | fullscreen (toggle) |

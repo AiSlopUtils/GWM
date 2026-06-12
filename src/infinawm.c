@@ -197,7 +197,7 @@ static Atom A_WM_PROTOCOLS, A_WM_DELETE, A_WM_STATE, A_WM_TAKE_FOCUS,
 #define TM_W 560
 #define TM_ROWH 30
 #define TM_HDR 40
-#define TM_GRAPH 64             /* system cpu/ram graph height           */
+#define TM_GRAPH 128            /* system cpu/ram/disk/net graph height  */
 #define TM_ROWTOP (TM_HDR + TM_GRAPH + 8)
 #define TM_ICON 20
 #define TM_MAXROWS 24
@@ -213,11 +213,13 @@ static int tm_nrows;
 static Time tm_click_time;
 static int tm_click_row = -1;
 
-/* system-wide cpu/ram history for the panel graph */
+/* system-wide cpu/ram/disk/net history for the panel graph */
 static double hist_cpu[HIST_MAX], hist_ram[HIST_MAX];
+static double hist_dsk[HIST_MAX], hist_net[HIST_MAX];   /* bytes/s */
 static int hist_len;
 static double sys_sampled;
 static unsigned long long cpu_prev_total, cpu_prev_busy;
+static unsigned long long dsk_prev, net_prev;           /* byte counters */
 
 /* XEmbed system tray, docked at the bottom of the task manager panel */
 #define TRAY_MAX 16
@@ -1462,6 +1464,9 @@ static void sample_system(void) {
     FILE *f;
     char buf[256];
     double cpu = hist_len ? hist_cpu[hist_len - 1] : 0.0, ram = 0.0;
+    double dsk = 0.0, net = 0.0;
+    double tnow = now_s();
+    double dt = sys_sampled > 0 ? tnow - sys_sampled : 0.0;
     f = fopen("/proc/stat", "r");
     if (f) {
         unsigned long long u = 0, n = 0, s = 0, i = 0, io = 0,
@@ -1489,18 +1494,63 @@ static void sample_system(void) {
         fclose(f);
         if (total > 0) ram = 100.0 * (total - avail) / total;
     }
+    /* disk: pgpgin/pgpgout from /proc/vmstat are KiB moved to/from disk */
+    f = fopen("/proc/vmstat", "r");
+    if (f) {
+        unsigned long long pin = 0, pout = 0;
+        int got = 0;
+        while (got < 2 && fgets(buf, sizeof buf, f)) {
+            if (!strncmp(buf, "pgpgin ", 7)) {
+                pin = strtoull(buf + 7, NULL, 10); got++;
+            } else if (!strncmp(buf, "pgpgout ", 8)) {
+                pout = strtoull(buf + 8, NULL, 10); got++;
+            }
+        }
+        fclose(f);
+        {
+            unsigned long long tot = (pin + pout) * 1024ULL;
+            if (dsk_prev && tot >= dsk_prev && dt > 0.1)
+                dsk = (double)(tot - dsk_prev) / dt;
+            dsk_prev = tot;
+        }
+    }
+    /* network: total rx+tx bytes over all interfaces except loopback */
+    f = fopen("/proc/net/dev", "r");
+    if (f) {
+        unsigned long long tot = 0;
+        while (fgets(buf, sizeof buf, f)) {
+            unsigned long long rx = 0, tx = 0;
+            char *colon = strchr(buf, ':'), *nm = buf;
+            if (!colon) continue;
+            *colon = 0;
+            while (*nm == ' ' || *nm == '\t') nm++;
+            if (!strcmp(nm, "lo")) continue;
+            if (sscanf(colon + 1,
+                       "%llu %*u %*u %*u %*u %*u %*u %*u %llu",
+                       &rx, &tx) == 2)
+                tot += rx + tx;
+        }
+        fclose(f);
+        if (net_prev && tot >= net_prev && dt > 0.1)
+            net = (double)(tot - net_prev) / dt;
+        net_prev = tot;
+    }
     if (cpu < 0) cpu = 0; if (cpu > 100) cpu = 100;
     if (ram < 0) ram = 0; if (ram > 100) ram = 100;
     if (hist_len == HIST_MAX) {
         memmove(hist_cpu, hist_cpu + 1, (HIST_MAX - 1) * sizeof(double));
         memmove(hist_ram, hist_ram + 1, (HIST_MAX - 1) * sizeof(double));
+        memmove(hist_dsk, hist_dsk + 1, (HIST_MAX - 1) * sizeof(double));
+        memmove(hist_net, hist_net + 1, (HIST_MAX - 1) * sizeof(double));
         hist_len--;
     }
     hist_cpu[hist_len] = cpu;
     hist_ram[hist_len] = ram;
+    hist_dsk[hist_len] = dsk;
+    hist_net[hist_len] = net;
     hist_len++;
     sample_battery();
-    sys_sampled = now_s();
+    sys_sampled = tnow;
 }
 
 /* sample cpu (utime+stime from /proc/pid/stat) and rss for all clients */
@@ -1551,6 +1601,16 @@ static void draw_tm(void) {
     char buf[160];
     for (c = clients; c && n < TM_MAXROWS; c = c->next)
         if (tm_is_listed(c)) tm_rows[n++] = c;
+    {
+        /* heaviest RAM users first (stable: no jitter between redraws) */
+        int a, b;
+        for (a = 1; a < n; a++) {
+            Client *t = tm_rows[a];
+            for (b = a - 1; b >= 0 && tm_rows[b]->rss_kb < t->rss_kb; b--)
+                tm_rows[b + 1] = tm_rows[b];
+            tm_rows[b + 1] = t;
+        }
+    }
     tm_nrows = n;
     traytop = TM_ROWTOP + (n ? n * TM_ROWH : TM_ROWH) + 6;
     h = traytop + TRAY_ROW + 8;
@@ -1576,8 +1636,13 @@ static void draw_tm(void) {
     {
         int gx = 12, gy = TM_HDR, gw = TM_W - 24, gh = TM_GRAPH - 12;
         double step = (double)gw / (HIST_MAX - 1);
-        XPoint pc[HIST_MAX], pr[HIST_MAX];
+        XPoint pc[HIST_MAX], pr[HIST_MAX], pd[HIST_MAX], pn[HIST_MAX];
+        double dmax = 1048576.0, nmax = 1048576.0;  /* >= 1 MB/s scale */
         int k;
+        for (k = 0; k < hist_len; k++) {
+            if (hist_dsk[k] > dmax) dmax = hist_dsk[k];
+            if (hist_net[k] > nmax) nmax = hist_net[k];
+        }
         XSetForeground(dpy, tmgc, 0x333333);
         XDrawRectangle(dpy, tmwin, tmgc, gx, gy, (unsigned)gw, (unsigned)gh);
         XSetForeground(dpy, tmgc, 0x1c1c1c);
@@ -1586,25 +1651,45 @@ static void draw_tm(void) {
         for (k = 0; k < hist_len; k++) {
             int xk = gx + gw - (int)((hist_len - 1 - k) * step);
             if (xk <= gx) xk = gx + 1;
-            pc[k].x = (short)xk;
+            pc[k].x = pr[k].x = pd[k].x = pn[k].x = (short)xk;
             pc[k].y = (short)(gy + gh - 1 - (int)(hist_cpu[k] / 100.0 * (gh - 2)));
-            pr[k].x = (short)xk;
             pr[k].y = (short)(gy + gh - 1 - (int)(hist_ram[k] / 100.0 * (gh - 2)));
+            pd[k].y = (short)(gy + gh - 1 - (int)(hist_dsk[k] / dmax * (gh - 2)));
+            pn[k].y = (short)(gy + gh - 1 - (int)(hist_net[k] / nmax * (gh - 2)));
         }
         if (hist_len > 1) {
-            XSetForeground(dpy, tmgc, 0xff5f57);          /* ram: red  */
+            XSetForeground(dpy, tmgc, 0xff5f57);          /* ram: red     */
             XDrawLines(dpy, tmwin, tmgc, pr, hist_len, CoordModeOrigin);
-            XSetForeground(dpy, tmgc, 0x4a90e2);          /* cpu: blue */
+            XSetForeground(dpy, tmgc, 0x28c840);          /* disk: green  */
+            XDrawLines(dpy, tmwin, tmgc, pd, hist_len, CoordModeOrigin);
+            XSetForeground(dpy, tmgc, 0x4a90e2);          /* net: blue    */
+            XDrawLines(dpy, tmwin, tmgc, pn, hist_len, CoordModeOrigin);
+            XSetForeground(dpy, tmgc, 0x9b59b6);          /* cpu: purple  */
             XDrawLines(dpy, tmwin, tmgc, pc, hist_len, CoordModeOrigin);
         }
         if (hist_len) {
+            double dv = hist_dsk[hist_len - 1], nv = hist_net[hist_len - 1];
             snprintf(buf, sizeof buf, "CPU %.0f%%", hist_cpu[hist_len - 1]);
-            XSetForeground(dpy, tmgc, 0x4a90e2);
+            XSetForeground(dpy, tmgc, 0x9b59b6);
             XDrawString(dpy, tmwin, tmgc, gx + 6, gy + 14, buf,
                         (int)strlen(buf));
             snprintf(buf, sizeof buf, "RAM %.0f%%", hist_ram[hist_len - 1]);
             XSetForeground(dpy, tmgc, 0xff5f57);
             XDrawString(dpy, tmwin, tmgc, gx + 96, gy + 14, buf,
+                        (int)strlen(buf));
+            if (dv >= 1048576.0)
+                snprintf(buf, sizeof buf, "DSK %.1f MB/s", dv / 1048576.0);
+            else
+                snprintf(buf, sizeof buf, "DSK %.0f kB/s", dv / 1024.0);
+            XSetForeground(dpy, tmgc, 0x28c840);
+            XDrawString(dpy, tmwin, tmgc, gx + 186, gy + 14, buf,
+                        (int)strlen(buf));
+            if (nv >= 1048576.0)
+                snprintf(buf, sizeof buf, "NET %.1f MB/s", nv / 1048576.0);
+            else
+                snprintf(buf, sizeof buf, "NET %.0f kB/s", nv / 1024.0);
+            XSetForeground(dpy, tmgc, 0x4a90e2);
+            XDrawString(dpy, tmwin, tmgc, gx + 296, gy + 14, buf,
                         (int)strlen(buf));
         }
         /* battery: green while charging/full, red when low, grey idle.
@@ -1620,7 +1705,7 @@ static void draw_tm(void) {
                            bat_charging                  ? 0x28c840 :
                            bat_pct >= 0 && bat_pct <= 15 ? 0xff5f57 :
                                                            0xc8c8c8);
-            XDrawString(dpy, tmwin, tmgc, gx + 186, gy + 14, buf,
+            XDrawString(dpy, tmwin, tmgc, gx + 406, gy + 14, buf,
                         (int)strlen(buf));
         }
     }
