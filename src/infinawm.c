@@ -19,7 +19,7 @@
  *   Mod+Shift+Up          fullscreen (toggle)
  *   Mod+Shift+Down        restore snapped window
  *   Mod+Tab               cycle focus (pans to the window)
- *   Mod+F                 fullscreen the focused window (toggle)
+ *   Mod+F                 maximize focused window (toggle, = green button)
  *   Mod+Q                 close window
  *   Mod+Shift+E           quit WM
  *   Mod+LeftDrag          move window (drag to screen edge to snap L/R/full)
@@ -1053,26 +1053,26 @@ static void paint(void) {
     XRenderColor col;
     Client *c;
     double spacing;
-    int cx1 = 0, cy1 = 0, cx2 = SW, cy2 = SH, partial = 0;
+    int clx1 = 0, cly1 = 0, clx2 = SW, cly2 = SH, partial = 0;
 
 #if HAVE_DAMAGE
     /* app-content damage only (typing, scrolling): repaint just the
      * damaged box instead of the whole screen */
     if (!dirty && pdirty) {
-        cx1 = dmgx1 > 0 ? dmgx1 : 0;
-        cy1 = dmgy1 > 0 ? dmgy1 : 0;
-        cx2 = dmgx2 < SW ? dmgx2 : SW;
-        cy2 = dmgy2 < SH ? dmgy2 : SH;
-        if (cx2 <= cx1 || cy2 <= cy1) { pdirty = 0; return; }
-        partial = cx1 > 0 || cy1 > 0 || cx2 < SW || cy2 < SH;
+        clx1 = dmgx1 > 0 ? dmgx1 : 0;
+        cly1 = dmgy1 > 0 ? dmgy1 : 0;
+        clx2 = dmgx2 < SW ? dmgx2 : SW;
+        cly2 = dmgy2 < SH ? dmgy2 : SH;
+        if (clx2 <= clx1 || cly2 <= cly1) { pdirty = 0; return; }
+        partial = clx1 > 0 || cly1 > 0 || clx2 < SW || cly2 < SH;
     }
     pdirty = 0;
 #endif
     if (partial) {
         XRectangle r;
-        r.x = (short)cx1; r.y = (short)cy1;
-        r.width  = (unsigned short)(cx2 - cx1);
-        r.height = (unsigned short)(cy2 - cy1);
+        r.x = (short)clx1; r.y = (short)cly1;
+        r.width  = (unsigned short)(clx2 - clx1);
+        r.height = (unsigned short)(cly2 - cly1);
         XRenderSetPictureClipRectangles(dpy, backpict, 0, 0, &r, 1);
         if (dgc) XSetClipRectangles(dpy, dgc, 0, 0, &r, 1, Unsorted);
     }
@@ -1094,10 +1094,10 @@ static void paint(void) {
         double oy = fmod(-vy * zoom, spacing); if (oy < 0) oy += spacing;
         double X, Y;
         col = rcol(COL_DOT);
-        for (Y = oy; Y < cy2; Y += spacing) {
-            if (Y + 2 < cy1) continue;
-            for (X = ox; X < cx2; X += spacing) {
-                if (X + 2 < cx1) continue;
+        for (Y = oy; Y < cly2; Y += spacing) {
+            if (Y + 2 < cly1) continue;
+            for (X = ox; X < clx2; X += spacing) {
+                if (X + 2 < clx1) continue;
                 XRenderFillRectangle(dpy, PictOpSrc, backpict, &col,
                                      (int)X, (int)Y, 2, 2);
             }
@@ -1115,8 +1115,8 @@ static void paint(void) {
             rw = (int)fmax(1.0, lround(c->w * zoom));
             rh = (int)fmax(1.0, lround(c->h * zoom));
         }
-        if (rx + rw + BORDER < cx1 || ry + rh + BORDER < cy1 ||
-            rx - BORDER > cx2 || ry - TBAR * zoom - BORDER > cy2)
+        if (rx + rw + BORDER < clx1 || ry + rh + BORDER < cly1 ||
+            rx - BORDER > clx2 || ry - TBAR * zoom - BORDER > cly2)
             continue;
         ensure_pict(c);
         if (!c->pict) continue;
@@ -1204,8 +1204,8 @@ static void paint(void) {
     }
 
     XRenderComposite(dpy, PictOpSrc, backpict, None, rootpict,
-                     cx1, cy1, 0, 0, cx1, cy1,
-                     (unsigned)(cx2 - cx1), (unsigned)(cy2 - cy1));
+                     clx1, cly1, 0, 0, clx1, cly1,
+                     (unsigned)(clx2 - clx1), (unsigned)(cly2 - cly1));
     if (partial) {
         XRenderPictureAttributes pa;
         pa.clip_mask = None;
@@ -1403,11 +1403,16 @@ static int tm_is_listed(Client *c) {
 static int bat_pct = -1;        /* -1: none found / unreadable */
 static int bat_charging;
 static char bat_auto[64];       /* cached auto-detected name */
+static double bat_sampled;
 
 static void sample_battery(void) {
     char path[160], buf[64];
     const char *name = battery_name[0] ? battery_name : bat_auto;
     FILE *f;
+    /* battery sysfs reads go through the EC and can block for tens of
+     * ms — at 1 Hz that stutters video. Battery moves slowly: 10 s. */
+    if (now_s() - bat_sampled < 10.0) return;
+    bat_sampled = now_s();
     bat_pct = -1;
     bat_charging = 0;
     if (!name[0]) {
@@ -1741,6 +1746,8 @@ static void open_tm(void) {
     if (lopen) close_launcher();
     tmopen = 1;
     tm_click_row = -1;
+    bat_sampled = 0;            /* show a fresh battery reading */
+    sample_battery();
     tm_sample();
     XMapRaised(dpy, tmwin);
     raise_panel(tmclient, tmwin);
@@ -1813,7 +1820,7 @@ static void key_normal(KeySym ks, unsigned state) {
         else spawn(locker_cmd);        /* lock screen (i3lock etc.)      */
         break;
     case XK_f:
-        if (focused) set_fullscreen(focused, !focused->fullscreen);
+        snap_client(focused, SNAP_FULL);   /* same as the green button */
         break;
     case XK_q:
         close_client(focused); break;
@@ -2412,6 +2419,14 @@ int main(void) {
             me.xclient.data.l[2] = (long)tmwin;
             XSendEvent(dpy, root, False, StructureNotifyMask, &me);
         }
+    }
+    /* announce ourselves as the compositor (_NET_WM_CM_Sn): browsers and
+     * video players check this to pick compositor-aware render paths */
+    {
+        char cmname[32];
+        snprintf(cmname, sizeof cmname, "_NET_WM_CM_S%d", scr);
+        XSetSelectionOwner(dpy, XInternAtom(dpy, cmname, False), tmwin,
+                           CurrentTime);
     }
     tmgc = XCreateGC(dpy, tmwin, 0, NULL);
     if (lfont) XSetFont(dpy, tmgc, lfont->fid);
