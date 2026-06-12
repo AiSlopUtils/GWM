@@ -64,6 +64,7 @@ Mod = Super (the Windows key).
 | `Mod+Shift+Up` | fullscreen (toggle) |
 | `Mod+Shift+Down` | restore snapped window |
 | `Mod+Tab` | cycle focus (flies to the window) |
+| `Mod+F` | fullscreen the focused window (toggle, no decorations) |
 | `Mod+Q` | close window |
 | `Mod+L` | lock the screen (runs the `locker` command from the config; install `i3lock`) |
 | `Mod+Shift+L` | log out (ends the session, back to the login screen) |

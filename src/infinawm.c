@@ -19,6 +19,7 @@
  *   Mod+Shift+Up          fullscreen (toggle)
  *   Mod+Shift+Down        restore snapped window
  *   Mod+Tab               cycle focus (pans to the window)
+ *   Mod+F                 fullscreen the focused window (toggle)
  *   Mod+Q                 close window
  *   Mod+Shift+E           quit WM
  *   Mod+LeftDrag          move window (drag to screen edge to snap L/R/full)
@@ -170,6 +171,10 @@ static Cursor cur_norm, cur_move, cur_h, cur_v, cur_nw, cur_ne, cur_sw, cur_se;
 static Cursor cur_current;
 
 static int dirty = 1;
+#if HAVE_DAMAGE
+static int pdirty;                      /* partial repaint pending       */
+static int dmgx1, dmgy1, dmgx2, dmgy2;  /* damaged bounding box, scr px  */
+#endif
 static int running = 1;
 static int placement_n;
 
@@ -558,6 +563,14 @@ static void set_zoom_at(double nz, double ax, double ay) {
         if (nz > 4.0) nz = 4.0;
     } else if (fabs(nz - 1.0) < 0.07) {
         nz = 1.0;                          /* snap to 100% near 1 */
+    }
+    if (tzoom == 1.0 && nz != 1.0) {
+        /* the pointer isn't polled while at 100%: refresh the anchor
+         * before the real layout starts depending on it */
+        Window qr, qw; int qx, qy, qwx, qwy; unsigned qm;
+        if (XQueryPointer(dpy, root, &qr, &qw, &qx, &qy, &qwx, &qwy, &qm)) {
+            pcx = qx; pcy = qy;
+        }
     }
     /* keep world point under anchor (screen coords, at target view) fixed */
     wx_ = tvx + ax / tzoom;
@@ -1040,6 +1053,29 @@ static void paint(void) {
     XRenderColor col;
     Client *c;
     double spacing;
+    int cx1 = 0, cy1 = 0, cx2 = SW, cy2 = SH, partial = 0;
+
+#if HAVE_DAMAGE
+    /* app-content damage only (typing, scrolling): repaint just the
+     * damaged box instead of the whole screen */
+    if (!dirty && pdirty) {
+        cx1 = dmgx1 > 0 ? dmgx1 : 0;
+        cy1 = dmgy1 > 0 ? dmgy1 : 0;
+        cx2 = dmgx2 < SW ? dmgx2 : SW;
+        cy2 = dmgy2 < SH ? dmgy2 : SH;
+        if (cx2 <= cx1 || cy2 <= cy1) { pdirty = 0; return; }
+        partial = cx1 > 0 || cy1 > 0 || cx2 < SW || cy2 < SH;
+    }
+    pdirty = 0;
+#endif
+    if (partial) {
+        XRectangle r;
+        r.x = (short)cx1; r.y = (short)cy1;
+        r.width  = (unsigned short)(cx2 - cx1);
+        r.height = (unsigned short)(cy2 - cy1);
+        XRenderSetPictureClipRectangles(dpy, backpict, 0, 0, &r, 1);
+        if (dgc) XSetClipRectangles(dpy, dgc, 0, 0, &r, 1, Unsorted);
+    }
 
     if (bgpict) {
         /* wallpaper: screen-fixed, the canvas moves over it */
@@ -1058,10 +1094,14 @@ static void paint(void) {
         double oy = fmod(-vy * zoom, spacing); if (oy < 0) oy += spacing;
         double X, Y;
         col = rcol(COL_DOT);
-        for (Y = oy; Y < SH; Y += spacing)
-            for (X = ox; X < SW; X += spacing)
+        for (Y = oy; Y < cy2; Y += spacing) {
+            if (Y + 2 < cy1) continue;
+            for (X = ox; X < cx2; X += spacing) {
+                if (X + 2 < cx1) continue;
                 XRenderFillRectangle(dpy, PictOpSrc, backpict, &col,
                                      (int)X, (int)Y, 2, 2);
+            }
+        }
     }
 
     for (c = clients; c; c = c->next) {
@@ -1075,7 +1115,8 @@ static void paint(void) {
             rw = (int)fmax(1.0, lround(c->w * zoom));
             rh = (int)fmax(1.0, lround(c->h * zoom));
         }
-        if (rx + rw < 0 || ry + rh < 0 || rx > SW || ry - TBAR * zoom > SH)
+        if (rx + rw + BORDER < cx1 || ry + rh + BORDER < cy1 ||
+            rx - BORDER > cx2 || ry - TBAR * zoom - BORDER > cy2)
             continue;
         ensure_pict(c);
         if (!c->pict) continue;
@@ -1163,7 +1204,14 @@ static void paint(void) {
     }
 
     XRenderComposite(dpy, PictOpSrc, backpict, None, rootpict,
-                     0, 0, 0, 0, 0, 0, (unsigned)SW, (unsigned)SH);
+                     cx1, cy1, 0, 0, cx1, cy1,
+                     (unsigned)(cx2 - cx1), (unsigned)(cy2 - cy1));
+    if (partial) {
+        XRenderPictureAttributes pa;
+        pa.clip_mask = None;
+        XRenderChangePicture(dpy, backpict, CPClipMask, &pa);
+        if (dgc) XSetClipMask(dpy, dgc, None);
+    }
     dirty = 0;
 }
 
@@ -1727,7 +1775,7 @@ static void grab_button(unsigned btn, unsigned mods) {
 }
 static void setup_grabs(void) {
     KeySym keys[] = { XK_Left, XK_Right, XK_Up, XK_Down, XK_equal, XK_plus,
-                      XK_minus, XK_0, XK_r, XK_q, XK_m, XK_l, XK_Return,
+                      XK_minus, XK_0, XK_r, XK_q, XK_m, XK_l, XK_f, XK_Return,
                       XK_Tab, XK_e };
     unsigned i;
     for (i = 0; i < sizeof keys / sizeof keys[0]; i++) {
@@ -1763,6 +1811,9 @@ static void key_normal(KeySym ks, unsigned state) {
     case XK_l:
         if (shift) running = 0;        /* log out (ends the X session)   */
         else spawn(locker_cmd);        /* lock screen (i3lock etc.)      */
+        break;
+    case XK_f:
+        if (focused) set_fullscreen(focused, !focused->fullscreen);
         break;
     case XK_q:
         close_client(focused); break;
@@ -2167,8 +2218,34 @@ static void handle_event(XEvent *ev) {
 #if HAVE_DAMAGE
         if (ev->type == damage_ev + XDamageNotify) {
             XDamageNotifyEvent *de = (XDamageNotifyEvent *)ev;
+            Client *dc = find_client(de->drawable);
             XDamageSubtract(dpy, de->damage, None, None);
-            dirty = 1;
+            if (dc && dc->mapped) {
+                /* damaged box in screen px (window px == world units) */
+                int x1, y1, x2, y2;
+                if (dc->screenspace) {
+                    x1 = dc->lx + de->area.x;
+                    y1 = dc->ly + de->area.y;
+                    x2 = x1 + de->area.width;
+                    y2 = y1 + de->area.height;
+                } else {
+                    x1 = (int)floor(w2sx(dc->x + de->area.x));
+                    y1 = (int)floor(w2sy(dc->y + de->area.y));
+                    x2 = x1 + (int)ceil(de->area.width * zoom) + 1;
+                    y2 = y1 + (int)ceil(de->area.height * zoom) + 1;
+                }
+                x1 -= 2; y1 -= 2; x2 += 2; y2 += 2;
+                if (!pdirty) {
+                    dmgx1 = x1; dmgy1 = y1; dmgx2 = x2; dmgy2 = y2;
+                    pdirty = 1;
+                } else {
+                    if (x1 < dmgx1) dmgx1 = x1;
+                    if (y1 < dmgy1) dmgy1 = y1;
+                    if (x2 > dmgx2) dmgx2 = x2;
+                    if (y2 > dmgy2) dmgy2 = y2;
+                }
+            } else
+                dirty = 1;
         }
 #endif
         break;
@@ -2402,8 +2479,10 @@ int main(void) {
             XNextEvent(dpy, &ev);
             handle_event(&ev);
         }
-        /* keep the real layout anchored at the pointer while zoomed */
-        {
+        /* keep the real layout anchored at the pointer while zoomed.
+         * At 100% the anchor is identity — skip the synchronous
+         * round-trip entirely (it costs latency on every wakeup). */
+        if (tzoom != 1.0 || zoom != 1.0) {
             Window r_, w_; int rx_, ry_, wx_, wy_; unsigned m_;
             if (XQueryPointer(dpy, root, &r_, &w_, &rx_, &ry_, &wx_, &wy_, &m_)
                 && ((int)pcx != rx_ || (int)pcy != ry_)) {
@@ -2420,7 +2499,7 @@ int main(void) {
         }
         animating = step_animation();
 #if HAVE_DAMAGE
-        if (dirty || animating) paint();
+        if (dirty || pdirty || animating) paint();
         tv.tv_sec = 0;
         tv.tv_usec = animating ? 16000
                      : ((tzoom != 1.0 || tmopen) ? 16000 : 250000);
