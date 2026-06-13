@@ -1,7 +1,7 @@
 /* Minimal vendored Xdamage.h — used only when libxdamage-dev is not
  * installed (compile-time check / fallback). Matches libXdamage.so.1 ABI. */
-#ifndef INFWM_VENDOR_XDAMAGE_H
-#define INFWM_VENDOR_XDAMAGE_H
+#ifndef GWM_VENDOR_XDAMAGE_H
+#define GWM_VENDOR_XDAMAGE_H
 
 #include <X11/Xlib.h>
 #include <X11/extensions/Xfixes.h>

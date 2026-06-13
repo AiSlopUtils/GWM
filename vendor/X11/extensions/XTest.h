@@ -1,7 +1,7 @@
 /* Minimal vendored XTest.h — used only when libxtst-dev is not installed.
  * Matches the ABI of libXtst.so.6. Only used by the test tool, not the WM. */
-#ifndef INFWM_VENDOR_XTEST_H
-#define INFWM_VENDOR_XTEST_H
+#ifndef GWM_VENDOR_XTEST_H
+#define GWM_VENDOR_XTEST_H
 
 #include <X11/Xlib.h>
 

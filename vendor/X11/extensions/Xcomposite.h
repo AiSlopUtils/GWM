@@ -1,7 +1,7 @@
 /* Minimal vendored Xcomposite.h — used only when libxcomposite-dev is not
  * installed. Matches the ABI of libXcomposite.so.1. */
-#ifndef INFWM_VENDOR_XCOMPOSITE_H
-#define INFWM_VENDOR_XCOMPOSITE_H
+#ifndef GWM_VENDOR_XCOMPOSITE_H
+#define GWM_VENDOR_XCOMPOSITE_H
 
 #include <X11/Xlib.h>
 

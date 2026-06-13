@@ -38,7 +38,7 @@ LIB_XIN    := $(if $(filter 1,$(HAVE_XINERAMA)),$(call findlib,Xinerama),)
 
 all: gwm
 
-gwm: src/infinawm.c
+gwm: src/gwm.c
 	$(CC) $(CFLAGS) $(INC) -DHAVE_DAMAGE=$(HAVE_DAMAGE) \
 	  -DHAVE_IMLIB2=$(HAVE_IMLIB2) -DHAVE_XINERAMA=$(HAVE_XINERAMA) -o $@ $< \
 	  -lX11 $(LIB_XREND) $(LIB_XCOMP) $(LIB_XDAM) $(LIB_IMLIB) $(LIB_XIN) -lm

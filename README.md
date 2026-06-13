@@ -89,8 +89,9 @@ row of the `Mod+M` panel and are fully clickable there.
 
 ## Configuration
 
-GWM reads `~/.config/infinawm/config.yml` (or `~/.infinawm.yml`) at startup,
-and writes a commented default on first run:
+GWM reads `~/.config/gwm/config.yml` (or `~/.gwm.yml`) at startup, and
+writes a commented default on first run. A pre-rename
+`~/.config/infinawm/config.yml` is still read as a fallback:
 
 ```yaml
 # programs launched once at startup, separated by spaces
@@ -138,7 +139,7 @@ the flat background color is used.
 ## Repo layout
 
 ```
-src/infinawm.c      the entire WM + compositor
+src/gwm.c           the entire WM + compositor
 Makefile            auto-detects dev headers, falls back to vendor/
 vendor/             minimal X11 extension headers for header-less builds
 ```

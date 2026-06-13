@@ -1,4 +1,4 @@
-/* infinawm — an infinite-canvas compositing window manager for Xorg.
+/* GWM (Geo's Window Manager) — an infinite-canvas compositing WM for Xorg.
  *
  * Windows live at coordinates on an unbounded 2D canvas. A viewport
  * (pan offset + zoom factor) decides what you see. Zoom is pure display
@@ -110,7 +110,7 @@ typedef enum { HIT_NONE = 0, HIT_TITLE, HIT_CLOSE, HIT_MAX, HIT_RESIZE } Hit;
 typedef enum { SNAP_NONE = 0, SNAP_L, SNAP_R, SNAP_FULL,
                SNAP_TL, SNAP_TR, SNAP_BL, SNAP_BR } Snap;
 
-/* user-configurable (from ~/.config/infinawm/config.yml) */
+/* user-configurable (from ~/.config/gwm/config.yml) */
 static unsigned long col_bg     = COL_BG;
 static unsigned long col_border = COL_BORDER;
 static unsigned long col_focus  = COL_FOCUS;
@@ -258,7 +258,7 @@ static int xerror(Display *d, XErrorEvent *e) {
         e->error_code == BadMatch || e->error_code == BadPixmap ||
         e->error_code == BadAccess)
         return 0; /* windows vanish at any time; ignore */
-    fprintf(stderr, "infinawm: X error code=%d req=%d\n",
+    fprintf(stderr, "gwm: X error code=%d req=%d\n",
             e->error_code, e->request_code);
     return 0;
 }
@@ -284,7 +284,7 @@ static double now_s(void) {
     return tv.tv_sec + tv.tv_usec / 1e6;
 }
 
-/* ---- config: ~/.config/infinawm/config.yml --------------------------- */
+/* ---- config: ~/.config/gwm/config.yml --------------------------- */
 static unsigned long parse_color(const char *s, unsigned long def) {
     char hex[8];
     int n = 0;
@@ -304,7 +304,7 @@ static unsigned long parse_color(const char *s, unsigned long def) {
 }
 
 static const char *config_default =
-    "# infinawm configuration\n"
+    "# GWM configuration\n"
     "\n"
     "# programs launched once at startup, separated by spaces\n"
     "autostart: \"\"\n"
@@ -332,11 +332,17 @@ static void load_config(void) {
     const char *home = getenv("HOME");
     FILE *f;
     if (!home) return;
-    snprintf(path, sizeof path, "%s/.config/infinawm/config.yml", home);
+    snprintf(path, sizeof path, "%s/.config/gwm/config.yml", home);
     f = fopen(path, "r");
     if (!f) {
         char alt[512];
-        snprintf(alt, sizeof alt, "%s/.infinawm.yml", home);
+        snprintf(alt, sizeof alt, "%s/.gwm.yml", home);
+        f = fopen(alt, "r");
+    }
+    if (!f) {
+        /* legacy location from before the GWM rename */
+        char alt[512];
+        snprintf(alt, sizeof alt, "%s/.config/infinawm/config.yml", home);
         f = fopen(alt, "r");
     }
     if (!f) {
@@ -344,7 +350,7 @@ static void load_config(void) {
         char dir[512];
         snprintf(dir, sizeof dir, "%s/.config", home);
         mkdir(dir, 0755);
-        snprintf(dir, sizeof dir, "%s/.config/infinawm", home);
+        snprintf(dir, sizeof dir, "%s/.config/gwm", home);
         mkdir(dir, 0755);
         f = fopen(path, "w");
         if (f) { fputs(config_default, f); fclose(f); }
@@ -1017,7 +1023,7 @@ static void load_wallpaper(void) {
             snprintf(path, sizeof path, "%s", bg_image);
         im = imlib_load_image(path);
         if (!im) {
-            fprintf(stderr, "infinawm: cannot load wallpaper %s\n", path);
+            fprintf(stderr, "gwm: cannot load wallpaper %s\n", path);
             return;
         }
         imlib_context_set_image(im);
@@ -1080,7 +1086,7 @@ static void load_wallpaper(void) {
         XFreePixmap(dpy, spm);
     }
 #else
-    fprintf(stderr, "infinawm: built without Imlib2; "
+    fprintf(stderr, "gwm: built without Imlib2; "
                     "background_image ignored (apt install libimlib2-dev)\n");
 #endif
 }
@@ -2425,7 +2431,7 @@ int main(void) {
     load_config();
 
     dpy = XOpenDisplay(NULL);
-    if (!dpy) { fprintf(stderr, "infinawm: cannot open display\n"); return 1; }
+    if (!dpy) { fprintf(stderr, "gwm: cannot open display\n"); return 1; }
     scr = DefaultScreen(dpy);
     root = RootWindow(dpy, scr);
     SW = DisplayWidth(dpy, scr);
@@ -2443,14 +2449,14 @@ int main(void) {
                             ButtonReleaseMask | PointerMotionMask);
     XSync(dpy, False);
     if (wm_running_err) {
-        fprintf(stderr, "infinawm: another window manager is running\n");
+        fprintf(stderr, "gwm: another window manager is running\n");
         return 1;
     }
     XSetErrorHandler(xerror);
 
     if (!XCompositeQueryExtension(dpy, &cev, &cerr) ||
         !XRenderQueryExtension(dpy, &cev, &cerr)) {
-        fprintf(stderr, "infinawm: need Composite and Render extensions\n");
+        fprintf(stderr, "gwm: need Composite and Render extensions\n");
         return 1;
     }
     XCompositeQueryVersion(dpy, &maj, &min);
@@ -2458,7 +2464,7 @@ int main(void) {
     {
         int derr;
         if (!XDamageQueryExtension(dpy, &damage_ev, &derr)) {
-            fprintf(stderr, "infinawm: Damage extension missing\n");
+            fprintf(stderr, "gwm: Damage extension missing\n");
             return 1;
         }
     }
@@ -2505,11 +2511,11 @@ int main(void) {
         XChangeProperty(dpy, chk, A_NET_SUPPORTING, XA_WINDOW, 32,
                         PropModeReplace, (unsigned char *)&chk, 1);
         XChangeProperty(dpy, chk, A_NET_WM_NAME, A_UTF8, 8, PropModeReplace,
-                        (unsigned char *)"infinawm", 8);
+                        (unsigned char *)"GWM", 3);
         XChangeProperty(dpy, root, A_NET_SUPPORTING, XA_WINDOW, 32,
                         PropModeReplace, (unsigned char *)&chk, 1);
         XChangeProperty(dpy, root, A_NET_WM_NAME, A_UTF8, 8, PropModeReplace,
-                        (unsigned char *)"infinawm", 8);
+                        (unsigned char *)"GWM", 3);
     }
 
     cur_norm = XCreateFontCursor(dpy, XC_left_ptr);
