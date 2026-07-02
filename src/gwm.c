@@ -1031,6 +1031,114 @@ static void make_backbuffer(void) {
     backpict = XRenderCreatePicture(dpy, backpm, fmt_rgb, 0, NULL);
 }
 
+/* ---- anti-aliased title-bar buttons ----------------------------------- */
+/* XFillArc gives chunky aliased circles. Instead, rasterize A8 coverage
+ * masks on the CPU with 4x4 supersampling (cached per size) and let
+ * XRender composite solid color through them: smooth macOS-style dots
+ * at any zoom. */
+enum { BM_DISC, BM_X, BM_EXPAND, BM_NKIND };
+#define BTN_CACHE 10
+static struct { int d; Picture pict; } btn_cache[BM_NKIND][BTN_CACHE];
+static int btn_cache_pos[BM_NKIND];
+
+static int bm_inside(int kind, double x, double y, double d) {
+    double r = d / 2.0;
+    switch (kind) {
+    case BM_DISC:
+        return (x - r) * (x - r) + (y - r) * (y - r) <= r * r;
+    case BM_X: {                    /* close glyph: two diagonal strokes */
+        double in = d * 0.30, w = d * 0.075 > 0.7 ? d * 0.075 : 0.7;
+        if (x < in || x > d - in || y < in || y > d - in) return 0;
+        return fabs(x - y) <= w || fabs(d - x - y) <= w;
+    }
+    case BM_EXPAND: {               /* zoom glyph: two facing triangles */
+        double in = d * 0.28, s = d - 2.0 * in, g = d * 0.10;
+        if (x >= in && y >= in && (x - in) + (y - in) <= s - g)
+            return 1;               /* upper-left triangle */
+        return x <= d - in && y <= d - in &&
+               (d - in - x) + (d - in - y) <= s - g;
+    }
+    }
+    return 0;
+}
+
+static Picture btn_mask(int kind, int d) {
+    int i, x, y, sx_, sy_;
+    unsigned char *data;
+    XImage *xi;
+    Pixmap pm;
+    Picture pict;
+    GC gc;
+    for (i = 0; i < BTN_CACHE; i++)
+        if (btn_cache[kind][i].d == d) return btn_cache[kind][i].pict;
+    data = malloc((size_t)d * d);
+    if (!data) return None;
+    for (y = 0; y < d; y++)
+        for (x = 0; x < d; x++) {
+            int cov = 0;
+            for (sy_ = 0; sy_ < 4; sy_++)
+                for (sx_ = 0; sx_ < 4; sx_++)
+                    cov += bm_inside(kind, x + (sx_ + 0.5) / 4.0,
+                                     y + (sy_ + 0.5) / 4.0, d);
+            data[y * d + x] = (unsigned char)(cov * 255 / 16);
+        }
+    pm = XCreatePixmap(dpy, root, (unsigned)d, (unsigned)d, 8);
+    xi = XCreateImage(dpy, visual, 8, ZPixmap, 0, (char *)data,
+                      (unsigned)d, (unsigned)d, 8, d);
+    gc = XCreateGC(dpy, pm, 0, NULL);
+    XPutImage(dpy, pm, gc, xi, 0, 0, 0, 0, (unsigned)d, (unsigned)d);
+    XFreeGC(dpy, gc);
+    XDestroyImage(xi);              /* frees data too */
+    pict = XRenderCreatePicture(dpy, pm,
+                                XRenderFindStandardFormat(dpy, PictStandardA8),
+                                0, NULL);
+    XFreePixmap(dpy, pm);           /* the picture keeps a reference */
+    i = btn_cache_pos[kind]++ % BTN_CACHE;
+    if (btn_cache[kind][i].pict)
+        XRenderFreePicture(dpy, btn_cache[kind][i].pict);
+    btn_cache[kind][i].d = d;
+    btn_cache[kind][i].pict = pict;
+    return pict;
+}
+
+static Picture solid_pict(unsigned long rgb) {
+    static struct { unsigned long rgb; Picture pict; } cache[12];
+    static int pos;
+    int i;
+    XRenderColor col;
+    for (i = 0; i < 12; i++)
+        if (cache[i].pict && cache[i].rgb == rgb) return cache[i].pict;
+    col = rcol(rgb);
+    i = pos++ % 12;
+    if (cache[i].pict) XRenderFreePicture(dpy, cache[i].pict);
+    cache[i].rgb = rgb;
+    cache[i].pict = XRenderCreateSolidFill(dpy, &col);
+    return cache[i].pict;
+}
+
+static unsigned long dim_rgb(unsigned long c, double f) {
+    unsigned r = (unsigned)(((c >> 16) & 0xff) * f);
+    unsigned g = (unsigned)(((c >> 8) & 0xff) * f);
+    unsigned b = (unsigned)((c & 0xff) * f);
+    return (unsigned long)(r << 16 | g << 8 | b);
+}
+
+/* one traffic light: darker rim ring + face disc (+ hover glyph) */
+static void draw_btn(int x, int y, int d, unsigned long face,
+                     int glyph, unsigned long glyph_rgb) {
+    Picture m = btn_mask(BM_DISC, d);
+    if (!m) return;
+    XRenderComposite(dpy, PictOpOver, solid_pict(dim_rgb(face, 0.72)), m,
+                     backpict, 0, 0, 0, 0, x, y, (unsigned)d, (unsigned)d);
+    if (d > 4 && (m = btn_mask(BM_DISC, d - 2)))
+        XRenderComposite(dpy, PictOpOver, solid_pict(face), m, backpict,
+                         0, 0, 0, 0, x + 1, y + 1,
+                         (unsigned)(d - 2), (unsigned)(d - 2));
+    if (glyph >= 0 && (m = btn_mask(glyph, d)))
+        XRenderComposite(dpy, PictOpOver, solid_pict(glyph_rgb), m, backpict,
+                         0, 0, 0, 0, x, y, (unsigned)d, (unsigned)d);
+}
+
 /* load the wallpaper (if configured) and pre-scale it to cover the screen.
  * It is drawn in screen space, so it never moves with the canvas. */
 static void load_wallpaper(void) {
@@ -1260,38 +1368,13 @@ static void paint(void) {
                 int cy = by + gap;
                 int hov = (c == hover_c &&
                            (hover_hit == HIT_CLOSE || hover_hit == HIT_MAX));
-                XSetForeground(dpy, dgc, focusedc || hov ? COL_BTN_CLOSE
-                                                         : COL_BTN_IDLE);
-                XFillArc(dpy, backpm, dgc, cx1, cy, (unsigned)d, (unsigned)d,
-                         0, 360 * 64);
-                XSetForeground(dpy, dgc, focusedc || hov ? COL_BTN_MAX
-                                                         : COL_BTN_IDLE);
-                XFillArc(dpy, backpm, dgc, cx2, cy, (unsigned)d, (unsigned)d,
-                         0, 360 * 64);
-                if (hov && d >= 8) {
-                    /* x glyph in the red dot */
-                    int i = d * 3 / 10;
-                    XSetForeground(dpy, dgc, COL_GLYPH_CLO);
-                    XDrawLine(dpy, backpm, dgc, cx1 + i, cy + i,
-                              cx1 + d - i, cy + d - i);
-                    XDrawLine(dpy, backpm, dgc, cx1 + d - i, cy + i,
-                              cx1 + i, cy + d - i);
-                    /* expand glyph (two triangles) in the green dot */
-                    int s = d - 2 * i;
-                    XPoint t1[3] = {
-                        { (short)(cx2 + i),     (short)(cy + i) },
-                        { (short)(cx2 + i + s - 2), (short)(cy + i) },
-                        { (short)(cx2 + i),     (short)(cy + i + s - 2) } };
-                    XPoint t2[3] = {
-                        { (short)(cx2 + d - i),     (short)(cy + d - i) },
-                        { (short)(cx2 + d - i - s + 2), (short)(cy + d - i) },
-                        { (short)(cx2 + d - i),     (short)(cy + d - i - s + 2) } };
-                    XSetForeground(dpy, dgc, COL_GLYPH_MAX);
-                    XFillPolygon(dpy, backpm, dgc, t1, 3, Convex,
-                                 CoordModeOrigin);
-                    XFillPolygon(dpy, backpm, dgc, t2, 3, Convex,
-                                 CoordModeOrigin);
-                }
+                int glyphs = hov && d >= 8;
+                draw_btn(cx1, cy, d,
+                         focusedc || hov ? COL_BTN_CLOSE : COL_BTN_IDLE,
+                         glyphs ? BM_X : -1, COL_GLYPH_CLO);
+                draw_btn(cx2, cy, d,
+                         focusedc || hov ? COL_BTN_MAX : COL_BTN_IDLE,
+                         glyphs ? BM_EXPAND : -1, COL_GLYPH_MAX);
             }
             /* title text, centered like macOS */
             if (tb >= 15 && lfont && dgc && c->title[0]) {
