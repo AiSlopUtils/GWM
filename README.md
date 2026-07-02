@@ -58,7 +58,7 @@ Mod = Super (the Windows key).
 | `Mod+=` / `Mod+-` | zoom in / out (out: smooth image-like scaling; in: sharp whole steps, 100→200→300→400%) |
 | `Mod+scroll wheel` | zoom at the cursor |
 | `Mod+0` | reset zoom to 100% |
-| `Mod+R` | launcher — type a command, `Tab` completes, `Enter` runs |
+| `Mod+R` | launcher — type a command, `Tab` completes, `Enter` runs. The last 5 commands you've run appear below the input box; click one to run it again |
 | `Mod+M` | task manager — system graph (CPU purple, RAM red, disk green, network blue) plus open windows with icon, name, RAM and CPU, heaviest RAM users first; double-click a row to jump to that window. System tray icons dock in a row at the bottom |
 | `Mod+Enter` | spawn a terminal |
 | `Mod+Shift+Left/Right` | snap focused window to left / right half |
@@ -109,6 +109,10 @@ background_image: "~/Pictures/wall.png"
 # battery shown in the Mod+M panel: a name from /sys/class/power_supply
 # (e.g. BAT0, BAT1). Empty = auto-detect the first battery.
 battery: "BAT0"
+
+# low-battery popup threshold (%). A warning appears when the battery
+# drops to or below this level while discharging. Set to 0 to disable.
+battery_warn: 15
 ```
 
 Wallpaper support needs Imlib2 at build time (`sudo apt install

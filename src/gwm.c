@@ -79,6 +79,8 @@
 #define MAX_BINS 8192
 #define LAUNCHER_W 640
 #define LAUNCHER_H 44
+#define NOT_W 360               /* battery-warning popup width / height   */
+#define NOT_H 68
 
 /* resize edge bits */
 #define EDGE_N 1
@@ -118,6 +120,7 @@ static char autostart_cmds[1024];
 static char bg_image[512];      /* wallpaper path; screen-fixed */
 static char locker_cmd[256] = "i3lock -c 000000 || slock || xsecurelock";
 static char battery_name[64];   /* /sys/class/power_supply entry; ""=auto */
+static int bat_warn_pct = 15;   /* warn below this %; 0 = disabled        */
 
 typedef struct Client {
     Window win;
@@ -185,6 +188,8 @@ static int running = 1;
 static int placement_n;
 
 /* launcher */
+#define LHIST_MAX 5              /* recent-commands shown below the input */
+#define LAUNCHER_HROWH 26
 static Window lwin;
 static Client *lclient;
 static GC lgc;
@@ -193,6 +198,8 @@ static char ltext[256];
 static int lopen;
 static char *bins[MAX_BINS];
 static int nbins = -1;
+static char lhist[LHIST_MAX][256];  /* most-recent-first */
+static int lhist_n;
 
 static Atom A_WM_PROTOCOLS, A_WM_DELETE, A_WM_STATE, A_WM_TAKE_FOCUS,
             A_NET_SUPPORTING, A_NET_WM_NAME, A_NET_ACTIVE, A_UTF8,
@@ -234,6 +241,13 @@ static unsigned long long dsk_prev, net_prev;           /* byte counters */
 static Window tray[TRAY_MAX];
 static int ntray;
 static Atom A_TRAY_SEL, A_TRAY_OPCODE, A_TRAY_ORIENT, A_MANAGER, A_XEMBED;
+
+/* battery-warning popup */
+static Window notwin;
+static Client *notclient;
+static GC notgc;
+static double notclose_at;     /* monotonic time to auto-dismiss; 0 = hidden */
+static int bat_warned;         /* already warned this discharge cycle */
 
 /* decoration hover state (for macOS-style button glyphs) */
 static Client *hover_c;
@@ -325,7 +339,10 @@ static const char *config_default =
     "# battery shown in the Super+M panel: a name from\n"
     "# /sys/class/power_supply (e.g. BAT0, BAT1).\n"
     "# Empty = auto-detect the first battery.\n"
-    "battery: \"\"\n";
+    "battery: \"\"\n"
+    "\n"
+    "# low-battery popup warning threshold (percent). Set to 0 to disable.\n"
+    "battery_warn: 15\n";
 
 static void load_config(void) {
     char path[512], line[1280];
@@ -387,6 +404,8 @@ static void load_config(void) {
             snprintf(autostart_cmds, sizeof autostart_cmds, "%s", val);
         else if (!strcmp(key, "battery"))
             snprintf(battery_name, sizeof battery_name, "%s", val);
+        else if (!strcmp(key, "battery_warn"))
+            bat_warn_pct = atoi(val);
         else if (!strcmp(key, "locker") && *val)
             snprintf(locker_cmd, sizeof locker_cmd, "%s", val);
         else if (!strcmp(key, "background_image"))
@@ -560,6 +579,7 @@ static void raise_client(Client *c) {
     restack_frame(c);
     if (lopen && c != lclient) raise_panel(lclient, lwin);
     if (tmopen && c != tmclient) raise_panel(tmclient, tmwin);
+    if (notclose_at && c != notclient) raise_panel(notclient, notwin);
     dirty = 1;
 }
 
@@ -772,7 +792,7 @@ static void update_title(Client *c) {
 static void manage(Window w, XWindowAttributes *wa) {
     Client *c;
     int want_fs = 0;
-    if (find_client(w) || w == lwin || w == tmwin || w == backpm) return;
+    if (find_client(w) || w == lwin || w == tmwin || w == notwin || w == backpm) return;
     c = calloc(1, sizeof(Client));
     c->win = w;
     c->is_or = wa->override_redirect;
@@ -1290,6 +1310,51 @@ static void paint(void) {
     dirty = 0;
 }
 
+/* ---- battery-warning popup ------------------------------------------- */
+static void draw_notif(void) {
+    char line1[64], line2[48];
+    int tx, ty, font_h;
+    if (!notclose_at) return;
+    snprintf(line1, sizeof line1, "Battery Low: %d%%", bat_pct);
+    snprintf(line2, sizeof line2, "Click to dismiss");
+    font_h = lfont ? lfont->ascent + lfont->descent : 14;
+    /* background */
+    XSetForeground(dpy, notgc, COL_LBG);
+    XFillRectangle(dpy, notwin, notgc, 0, 0, NOT_W, NOT_H);
+    /* red border (2 px) */
+    XSetForeground(dpy, notgc, 0xff5f57);
+    XDrawRectangle(dpy, notwin, notgc, 0, 0, NOT_W - 1, NOT_H - 1);
+    XDrawRectangle(dpy, notwin, notgc, 1, 1, NOT_W - 3, NOT_H - 3);
+    /* main text */
+    tx = 16;
+    ty = (NOT_H - font_h * 2 - 6) / 2 + (lfont ? lfont->ascent : 12);
+    XSetForeground(dpy, notgc, 0xffffff);
+    XDrawString(dpy, notwin, notgc, tx, ty, line1, (int)strlen(line1));
+    /* dim sub-text */
+    XSetForeground(dpy, notgc, COL_LHINT);
+    XDrawString(dpy, notwin, notgc, tx, ty + font_h + 6,
+                line2, (int)strlen(line2));
+    dirty = 1;
+}
+static void show_battery_notif(void) {
+    int nx = SW - NOT_W - 20, ny = 20;
+    notclose_at = now_s() + 8.0;   /* auto-dismiss after 8 s */
+    XMoveResizeWindow(dpy, notwin, nx, ny, NOT_W, NOT_H);
+    XMapRaised(dpy, notwin);
+    if (notclient) { notclient->mapped = 1; free_pict(notclient);
+        notclient->lx = nx; notclient->ly = ny;
+        notclient->lw = NOT_W; notclient->lh = NOT_H; }
+    raise_panel(notclient, notwin);
+    draw_notif();
+}
+static void close_notif(void) {
+    if (!notclose_at) return;
+    notclose_at = 0;
+    XUnmapWindow(dpy, notwin);
+    if (notclient) { notclient->mapped = 0; free_pict(notclient); }
+    dirty = 1;
+}
+
 /* ---- launcher -------------------------------------------------------- */
 static int bin_cmp(const void *a, const void *b) {
     return strcmp(*(char *const *)a, *(char *const *)b);
@@ -1327,12 +1392,40 @@ static const char *completion(void) {
     return NULL;
 }
 
+/* record a ran command as most-recent, de-duplicating and capping at
+ * LHIST_MAX entries so the launcher can offer one-click re-run. */
+static void add_lhistory(const char *cmd) {
+    int i, j;
+    if (!cmd[0]) return;
+    for (i = 0; i < lhist_n; i++) {
+        if (!strcmp(lhist[i], cmd)) {
+            for (j = i; j < lhist_n - 1; j++)
+                snprintf(lhist[j], sizeof lhist[j], "%s", lhist[j + 1]);
+            lhist_n--;
+            break;
+        }
+    }
+    if (lhist_n < LHIST_MAX) lhist_n++;
+    for (j = lhist_n - 1; j > 0; j--)
+        snprintf(lhist[j], sizeof lhist[j], "%s", lhist[j - 1]);
+    snprintf(lhist[0], sizeof lhist[0], "%s", cmd);
+}
+
 static void draw_launcher(void) {
     const char *hint = completion();
     int tx = 14, ty = LAUNCHER_H / 2 + (lfont ? lfont->ascent / 2 : 5);
+    int h = LAUNCHER_H + (lhist_n ? lhist_n * LAUNCHER_HROWH + 6 : 0);
     char buf[300];
+    int i;
+    XMoveResizeWindow(dpy, lwin, (SW - LAUNCHER_W) / 2, 10,
+                      LAUNCHER_W, (unsigned)h);
+    if (lclient) {
+        if (lclient->lh != h) free_pict(lclient);
+        lclient->lx = (SW - LAUNCHER_W) / 2; lclient->ly = 10;
+        lclient->lw = LAUNCHER_W; lclient->lh = h;
+    }
     XSetForeground(dpy, lgc, COL_LBG);
-    XFillRectangle(dpy, lwin, lgc, 0, 0, LAUNCHER_W, LAUNCHER_H);
+    XFillRectangle(dpy, lwin, lgc, 0, 0, LAUNCHER_W, (unsigned)h);
     XSetForeground(dpy, lgc, COL_LACCENT);
     XFillRectangle(dpy, lwin, lgc, 0, LAUNCHER_H - 3, LAUNCHER_W, 3);
     XSetForeground(dpy, lgc, COL_LHINT);
@@ -1346,6 +1439,16 @@ static void draw_launcher(void) {
         XDrawString(dpy, lwin, lgc, tx + 50 + off, ty,
                     hint + strlen(ltext), (int)strlen(hint + strlen(ltext)));
     }
+    for (i = 0; i < lhist_n; i++) {
+        int ry = LAUNCHER_H + 4 + i * LAUNCHER_HROWH;
+        int rty = ry + LAUNCHER_HROWH / 2 + (lfont ? lfont->ascent / 2 : 5);
+        XSetForeground(dpy, lgc, COL_LFG);
+        XDrawString(dpy, lwin, lgc, tx, rty, lhist[i], (int)strlen(lhist[i]));
+        if (i < lhist_n - 1)
+            XSetForeground(dpy, lgc, 0x2a2f44);
+        XDrawLine(dpy, lwin, lgc, 8, ry + LAUNCHER_HROWH,
+                 LAUNCHER_W - 8, ry + LAUNCHER_HROWH);
+    }
     dirty = 1;
 }
 
@@ -1354,7 +1457,6 @@ static void open_launcher(void) {
     scan_path();
     ltext[0] = 0;
     lopen = 1;
-    XMoveResizeWindow(dpy, lwin, (SW - LAUNCHER_W) / 2, 10, LAUNCHER_W, LAUNCHER_H);
     XMapRaised(dpy, lwin);
     raise_panel(lclient, lwin);
     XGrabKeyboard(dpy, root, False, GrabModeAsync, GrabModeAsync, CurrentTime);
@@ -1370,6 +1472,20 @@ static void close_launcher(void) {
     if (focused) XSetInputFocus(dpy, focused->win, RevertToPointerRoot, CurrentTime);
     dirty = 1;
 }
+/* click on a history row below the input: re-run that command */
+static void launcher_click(XButtonEvent *ev) {
+    int row;
+    if (ev->button != Button1 || ev->y < LAUNCHER_H + 4) return;
+    row = (ev->y - (LAUNCHER_H + 4)) / LAUNCHER_HROWH;
+    if (row < 0 || row >= lhist_n) return;
+    {
+        char cmd[256];
+        snprintf(cmd, sizeof cmd, "%s", lhist[row]);
+        close_launcher();
+        spawn(cmd);
+        add_lhistory(cmd);
+    }
+}
 static void launcher_key(XKeyEvent *ev) {
     char buf[32];
     KeySym ks;
@@ -1380,7 +1496,7 @@ static void launcher_key(XKeyEvent *ev) {
         char cmd[300];
         snprintf(cmd, sizeof cmd, "%s", ltext);
         close_launcher();
-        spawn(cmd);
+        if (cmd[0]) { spawn(cmd); add_lhistory(cmd); }
         return;
     }
     if (ks == XK_Tab) {
@@ -1530,6 +1646,15 @@ static void sample_battery(void) {
             (!strncmp(buf, "Charging", 8) || !strncmp(buf, "Full", 4)))
             bat_charging = 1;
         fclose(f);
+    }
+    /* reset the warned flag once charging or comfortably above threshold */
+    if (bat_charging || bat_pct > bat_warn_pct + 5)
+        bat_warned = 0;
+    /* show popup if low, discharging, and not already warned */
+    if (bat_warn_pct > 0 && bat_pct >= 0 &&
+        bat_pct <= bat_warn_pct && !bat_charging && !bat_warned) {
+        bat_warned = 1;
+        show_battery_notif();
     }
 }
 
@@ -2022,7 +2147,14 @@ static void unsnap_under_cursor(Client *c, XButtonEvent *ev) {
 
 static void button_press(XButtonEvent *ev) {
     Client *c;
+    if (ev->window == lwin) {
+        /* clicking a history row re-runs it; clicking elsewhere in the
+         * launcher (the input row) does nothing special */
+        if (lopen) launcher_click(ev);
+        return;
+    }
     if (lopen) close_launcher();   /* clicking away dismisses the launcher */
+    if (notclose_at) close_notif();     /* any click dismisses the notif  */
     if (ev->window == tmwin) {
         /* task manager: double-click a row to jump to that window */
         int row = (ev->y - TM_ROWTOP) / TM_ROWH;
@@ -2343,6 +2475,8 @@ static void handle_event(XEvent *ev) {
             draw_launcher();
         if (ev->xexpose.window == tmwin && tmopen && ev->xexpose.count == 0)
             draw_tm();
+        if (ev->xexpose.window == notwin && notclose_at && ev->xexpose.count == 0)
+            draw_notif();
         break;
     case ClientMessage: {
         XClientMessageEvent *cm = &ev->xclient;
@@ -2532,7 +2666,7 @@ int main(void) {
     /* launcher window */
     swa.override_redirect = True;
     swa.background_pixel = 0;
-    swa.event_mask = ExposureMask;
+    swa.event_mask = ExposureMask | ButtonPressMask;
     lwin = XCreateWindow(dpy, root, (SW - LAUNCHER_W) / 2, 10,
                          LAUNCHER_W, LAUNCHER_H, 0, (int)depth, InputOutput,
                          visual, CWOverrideRedirect | CWBackPixel | CWEventMask,
@@ -2549,6 +2683,21 @@ int main(void) {
     lclient->lx = (SW - LAUNCHER_W) / 2; lclient->ly = 10;
     lclient->lw = LAUNCHER_W; lclient->lh = LAUNCHER_H;
     attach_top(lclient);
+
+    /* battery-warning popup (hidden until needed) */
+    swa.event_mask = ExposureMask | ButtonPressMask;
+    notwin = XCreateWindow(dpy, root, SW - NOT_W - 20, 20,
+                           NOT_W, NOT_H, 0, (int)depth, InputOutput,
+                           visual, CWOverrideRedirect | CWBackPixel | CWEventMask,
+                           &swa);
+    notgc = XCreateGC(dpy, notwin, 0, NULL);
+    if (lfont) XSetFont(dpy, notgc, lfont->fid);
+    notclient = calloc(1, sizeof(Client));
+    notclient->win = notwin;
+    notclient->screenspace = 1;
+    notclient->lx = SW - NOT_W - 20; notclient->ly = 20;
+    notclient->lw = NOT_W; notclient->lh = NOT_H;
+    attach_top(notclient);
 
     /* task manager window (Super+M) */
     swa.event_mask = ExposureMask | ButtonPressMask | SubstructureNotifyMask;
@@ -2674,6 +2823,8 @@ int main(void) {
                 draw_tm();
             }
         }
+        if (notclose_at && now_s() >= notclose_at)
+            close_notif();
         animating = step_animation();
 #if HAVE_DAMAGE
         if (dirty || pdirty || animating) paint();
