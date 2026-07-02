@@ -1311,6 +1311,8 @@ static void paint(void) {
 }
 
 /* ---- battery-warning popup ------------------------------------------- */
+static int bat_pct = -1;        /* -1: none found / unreadable */
+
 static void draw_notif(void) {
     char line1[64], line2[48];
     int tx, ty, font_h;
@@ -1591,7 +1593,6 @@ static int tm_is_listed(Client *c) {
 /* total cpu%% (/proc/stat) and ram%% (/proc/meminfo), once per second */
 /* battery: /sys/class/power_supply/<name>/{capacity,status}. The name
  * comes from the config ("battery:"), or the first type==Battery entry. */
-static int bat_pct = -1;        /* -1: none found / unreadable */
 static int bat_charging;
 static char bat_auto[64];       /* cached auto-detected name */
 static double bat_sampled;
