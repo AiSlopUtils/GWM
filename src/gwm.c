@@ -29,7 +29,7 @@
  *   Mod+RightDrag         resize window
  * Mouse on decorations:
  *   drag title bar        move (release at screen edge to snap L/R/full)
- *   title bar buttons     fullscreen toggle, close
+ *   title bar buttons     close, minimize (restore via Mod+M), fullscreen
  *   drag window border    resize (any edge or corner)
  *   drag empty canvas     pan
  * Zoom is permanent: windows are really scaled, so you can interact with
@@ -92,21 +92,25 @@
 #define EDGE_E 4
 #define EDGE_W 8
 
-typedef enum { HIT_NONE = 0, HIT_TITLE, HIT_CLOSE, HIT_MAX, HIT_RESIZE } Hit;
+typedef enum { HIT_NONE = 0, HIT_TITLE, HIT_CLOSE, HIT_MIN, HIT_MAX,
+               HIT_RESIZE } Hit;
 
-/* ---- colors (0xRRGGBB) ---- */
+/* ---- colors (0xRRGGBB), macOS dark-mode look ---- */
 #define COL_BG        0x000000
 #define COL_DOT       0x2a2f44
-#define COL_BORDER    0xffffff  /* unfocused border outline             */
-#define COL_FOCUS     0x4a90e2  /* focused border outline: subtle blue  */
-#define COL_TBAR      0x000000  /* unfocused title bar background       */
-#define COL_TBARF     0x000000  /* focused title bar background         */
-#define COL_TTEXT     0xffffff  /* unfocused title text                 */
-#define COL_TTEXTF    0xffffff  /* focused title text                   */
+#define COL_BORDER    0x4c4c4c  /* hairline outline (unfocused)         */
+#define COL_FOCUS     0x4c4c4c  /* hairline outline (focused): same —   */
+                                /* focus shows via buttons + title text */
+#define COL_TBAR      0x333335  /* unfocused title bar background       */
+#define COL_TBARF     0x3a3a3c  /* focused title bar background         */
+#define COL_TTEXT     0x767678  /* unfocused title text: dim gray       */
+#define COL_TTEXTF    0xb9b9bb  /* focused title text                   */
 #define COL_BTN_CLOSE 0xff5f57  /* macOS red                            */
+#define COL_BTN_MIN   0xfebc2e  /* macOS yellow                         */
 #define COL_BTN_MAX   0x28c840  /* macOS green                          */
-#define COL_BTN_IDLE  0x9a9a9a  /* dots on unfocused windows            */
+#define COL_BTN_IDLE  0x8b8b8b  /* dots on unfocused windows            */
 #define COL_GLYPH_CLO 0x7a1d1a  /* x glyph on hover                     */
+#define COL_GLYPH_MIN 0x9a6a15  /* minus glyph on hover                 */
 #define COL_GLYPH_MAX 0x1d6b27  /* expand glyph on hover                */
 #define COL_LBG       0x1f2335
 #define COL_LFG       0xc0caf5
@@ -136,6 +140,7 @@ typedef struct Client {
     int fullscreen;             /* EWMH fullscreen (no decorations)      */
     double fsx, fsy, fsw, fsh;  /* saved geometry for fullscreen restore */
     int mapped;
+    int minimized;              /* hidden; restore via task manager      */
     int ws;                     /* workspace this window lives on        */
     int is_or;                  /* override-redirect (menus, tooltips)   */
     int screenspace;            /* rendered in screen coords (launcher)  */
@@ -337,8 +342,8 @@ static const char *config_default =
     "\n"
     "# colors, hex (#rgb / #rrggbb)\n"
     "background_color: \"#000000\"\n"
-    "border_color: \"#ffffff\"\n"
-    "focus_color: \"#4a90e2\"\n"
+    "border_color: \"#4c4c4c\"\n"
+    "focus_color: \"#4c4c4c\"\n"
     "\n"
     "# wallpaper (png/jpg), scaled to cover the screen; stays fixed while\n"
     "# the canvas pans and zooms. Needs a build with libimlib2-dev.\n"
@@ -522,7 +527,8 @@ static void restack_frame(Client *c) {
 
 /* is this a normal, visible, user-facing window on the current workspace? */
 static int eligible(Client *c) {
-    return c->mapped && !c->is_or && !c->screenspace && c->ws == cur_ws;
+    return c->mapped && !c->is_or && !c->screenspace && !c->minimized &&
+           c->ws == cur_ws;
 }
 
 /* send an ICCCM WM_PROTOCOLS message if the client supports it */
@@ -624,7 +630,7 @@ static void apply_geometry(Client *c) {
     if (c->screenspace) return;
     px = (int)lround(c->x - tvx + anchor_x());
     py = (int)lround(c->y - tvy + anchor_y());
-    if (c->ws != cur_ws) { px = SW + 64; py = SH + 64; }  /* parked */
+    if (c->ws != cur_ws || c->minimized) { px = SW + 64; py = SH + 64; }
     pw = (int)fmax(1.0, lround(c->w));
     ph = (int)fmax(1.0, lround(c->h));
     if (px == c->lx && py == c->ly && pw == c->lw && ph == c->lh) return;
@@ -957,13 +963,25 @@ static Client *client_at(double sx_, double sy_) {
     Client *c, *hit = NULL;
     for (c = clients; c; c = c->next) {
         double rx, ry, rw, rh;
-        if (!c->mapped || c->screenspace || c->is_or || c->ws != cur_ws)
+        if (!c->mapped || c->screenspace || c->is_or || c->minimized ||
+            c->ws != cur_ws)
             continue;
         rx = w2sx(c->x); ry = w2sy(c->y) - TBAR * zoom;
         rw = c->w * zoom; rh = c->h * zoom + TBAR * zoom;
         if (sx_ >= rx && sx_ < rx + rw && sy_ >= ry && sy_ < ry + rh) hit = c;
     }
     return hit;
+}
+
+/* traffic-light geometry, shared by hit-testing and drawing.
+ * macOS proportions: tight dots on the left of the title bar. */
+static int btn_d(int tb) {
+    int d = (int)(tb * 0.46);
+    return d < 6 ? 6 : d;
+}
+static int btn_x(int rx, int tb, int i) {
+    int d = btn_d(tb);
+    return rx + (int)(d * 0.7) + i * (int)(d * 1.6);
 }
 
 /* classify a screen point against one client's decorations. The InputOnly
@@ -977,11 +995,16 @@ static Hit decor_zone(Client *c, int sx_, int sy_, int *edges) {
     int by = ry - tb;
     int e = 0;
     *edges = 0;
-    /* title bar; buttons on the left like macOS: [close][fullscreen] */
+    /* title bar; buttons on the left like macOS:
+     * [close][minimize][fullscreen] */
     if (sx_ >= rx - BORDER && sx_ < rx + rw + BORDER && sy_ >= by && sy_ < ry) {
         if (rw > 3 * tb) {
-            if (sx_ < rx + tb)     return HIT_CLOSE;
-            if (sx_ < rx + 2 * tb) return HIT_MAX;
+            int d = btn_d(tb), pad = (int)(d * 0.3), i;
+            for (i = 0; i < 3; i++) {
+                int bx = btn_x(rx, tb, i);
+                if (sx_ >= bx - pad && sx_ < bx + d + pad)
+                    return (Hit)(HIT_CLOSE + i);
+            }
         }
         return HIT_TITLE;
     }
@@ -1036,7 +1059,7 @@ static void make_backbuffer(void) {
  * masks on the CPU with 4x4 supersampling (cached per size) and let
  * XRender composite solid color through them: smooth macOS-style dots
  * at any zoom. */
-enum { BM_DISC, BM_X, BM_EXPAND, BM_NKIND };
+enum { BM_DISC, BM_X, BM_MINUS, BM_EXPAND, BM_NKIND };
 #define BTN_CACHE 10
 static struct { int d; Picture pict; } btn_cache[BM_NKIND][BTN_CACHE];
 static int btn_cache_pos[BM_NKIND];
@@ -1050,6 +1073,10 @@ static int bm_inside(int kind, double x, double y, double d) {
         double in = d * 0.30, w = d * 0.075 > 0.7 ? d * 0.075 : 0.7;
         if (x < in || x > d - in || y < in || y > d - in) return 0;
         return fabs(x - y) <= w || fabs(d - x - y) <= w;
+    }
+    case BM_MINUS: {                /* minimize glyph: horizontal bar */
+        double in = d * 0.26, w = d * 0.075 > 0.7 ? d * 0.075 : 0.7;
+        return x >= in && x <= d - in && fabs(y - r) <= w;
     }
     case BM_EXPAND: {               /* zoom glyph: two facing triangles */
         double in = d * 0.28, s = d - 2.0 * in, g = d * 0.10;
@@ -1123,11 +1150,21 @@ static unsigned long dim_rgb(unsigned long c, double f) {
     return (unsigned long)(r << 16 | g << 8 | b);
 }
 
-/* one traffic light: darker rim ring + face disc (+ hover glyph) */
-static void draw_btn(int x, int y, int d, unsigned long face,
+static unsigned long bright_rgb(unsigned long c, double f) {
+    unsigned r = (c >> 16) & 0xff, g = (c >> 8) & 0xff, b = c & 0xff;
+    r += (unsigned)((255 - r) * f);
+    g += (unsigned)((255 - g) * f);
+    b += (unsigned)((255 - b) * f);
+    return (unsigned long)(r << 16 | g << 8 | b);
+}
+
+/* one traffic light: darker rim ring + face disc (+ hover glyph).
+ * `hot` lightens the face of the button directly under the pointer. */
+static void draw_btn(int x, int y, int d, unsigned long face, int hot,
                      int glyph, unsigned long glyph_rgb) {
     Picture m = btn_mask(BM_DISC, d);
     if (!m) return;
+    if (hot) face = bright_rgb(face, 0.25);
     XRenderComposite(dpy, PictOpOver, solid_pict(dim_rgb(face, 0.72)), m,
                      backpict, 0, 0, 0, 0, x, y, (unsigned)d, (unsigned)d);
     if (d > 4 && (m = btn_mask(BM_DISC, d - 2)))
@@ -1325,7 +1362,7 @@ static void paint(void) {
     for (c = clients; c; c = c->next) {
         int rx, ry, rw, rh;
         if (!c->mapped) continue;
-        if (!c->screenspace && c->ws != cur_ws) continue;
+        if (!c->screenspace && (c->ws != cur_ws || c->minimized)) continue;
         if (c->screenspace) {
             rx = c->lx; ry = c->ly; rw = c->lw; rh = c->lh;
         } else {
@@ -1359,22 +1396,26 @@ static void paint(void) {
             XRenderFillRectangle(dpy, PictOpSrc, backpict, &col,
                                  rx, ry - BORDER > by ? ry - BORDER : by,
                                  (unsigned)rw, (unsigned)BORDER);
-            /* macOS-style traffic lights, left side: [close][fullscreen] */
-            if (tb >= 8 && rw > 3 * tb && dgc) {
-                int d = (int)fmax(6.0, tb * 0.5);
-                int gap = (tb - d) / 2;
-                int cx1 = rx + gap;          /* red close dot   */
-                int cx2 = rx + tb + gap;     /* green fullscreen dot */
-                int cy = by + gap;
-                int hov = (c == hover_c &&
-                           (hover_hit == HIT_CLOSE || hover_hit == HIT_MAX));
+            /* macOS traffic lights: [close][minimize][fullscreen].
+             * Hovering the cluster colors all three and shows the
+             * glyphs; the dot under the pointer lightens slightly. */
+            if (tb >= 8 && rw > 3 * tb) {
+                int d = btn_d(tb);
+                int cy = by + (tb - d) / 2;
+                int hov = (c == hover_c && hover_hit >= HIT_CLOSE &&
+                           hover_hit <= HIT_MAX);
                 int glyphs = hov && d >= 8;
-                draw_btn(cx1, cy, d,
-                         focusedc || hov ? COL_BTN_CLOSE : COL_BTN_IDLE,
-                         glyphs ? BM_X : -1, COL_GLYPH_CLO);
-                draw_btn(cx2, cy, d,
-                         focusedc || hov ? COL_BTN_MAX : COL_BTN_IDLE,
-                         glyphs ? BM_EXPAND : -1, COL_GLYPH_MAX);
+                unsigned long face[3] = { COL_BTN_CLOSE, COL_BTN_MIN,
+                                          COL_BTN_MAX };
+                unsigned long grgb[3] = { COL_GLYPH_CLO, COL_GLYPH_MIN,
+                                          COL_GLYPH_MAX };
+                int gkind[3] = { BM_X, BM_MINUS, BM_EXPAND };
+                int i;
+                for (i = 0; i < 3; i++)
+                    draw_btn(btn_x(rx, tb, i), cy, d,
+                             focusedc || hov ? face[i] : COL_BTN_IDLE,
+                             hov && hover_hit == (Hit)(HIT_CLOSE + i),
+                             glyphs ? gkind[i] : -1, grgb[i]);
             }
             /* title text, centered like macOS */
             if (tb >= 15 && lfont && dgc && c->title[0]) {
@@ -1384,7 +1425,8 @@ static void paint(void) {
                 if (len > 0) {
                     int tw = XTextWidth(lfont, c->title, len);
                     int tx = rx + (rw - tw) / 2;
-                    if (tx < rx + 2 * tb + 6) tx = rx + 2 * tb + 6;
+                    int clus = btn_x(rx, tb, 2) + btn_d(tb) + 8;
+                    if (tx < clus) tx = clus;
                     XSetForeground(dpy, dgc,
                                    focusedc ? COL_TTEXTF : COL_TTEXT);
                     XDrawString(dpy, backpm, dgc, tx,
@@ -1704,7 +1746,9 @@ static void ensure_icon(Client *c) {
 }
 
 static int tm_is_listed(Client *c) {
-    return eligible(c);
+    /* every normal window: any workspace, minimized or not, so the task
+     * manager doubles as the place to find hidden windows */
+    return c->mapped && !c->is_or && !c->screenspace;
 }
 
 /* total cpu%% (/proc/stat) and ram%% (/proc/meminfo), once per second */
@@ -2064,7 +2108,8 @@ static void draw_tm(void) {
         len = (int)strlen(buf);
         while (len > 0 && lfont &&
                XTextWidth(lfont, buf, len) > TM_W - 200 - 44) len--;
-        XSetForeground(dpy, tmgc, c == focused ? 0xffffff : 0xc8c8c8);
+        XSetForeground(dpy, tmgc, c == focused ? 0xffffff :
+                                  c->minimized ? 0x8e8e8e : 0xc8c8c8);
         XDrawString(dpy, tmwin, tmgc, 44, ty, buf, len);
         /* ram + cpu */
         XSetForeground(dpy, tmgc, 0xc8c8c8);
@@ -2166,19 +2211,49 @@ static void close_tm(void) {
 }
 
 /* ---- workspaces (Mod+1..9, Mod+Shift+1..9 sends the window) ----------- */
-/* park/unpark a client's real window and frame for its workspace */
+/* Unmapping/parking windows makes X generate EnterNotify for whatever
+ * ends up under the (stationary) pointer; focus-follows-mouse would then
+ * override the focus we just set. Drain those stale crossing events. */
+static void skip_enters(void) {
+    XEvent e;
+    XSync(dpy, False);
+    while (XCheckTypedEvent(dpy, EnterNotify, &e));
+}
+
+/* park/unpark a client's real window and frame for its workspace and
+ * minimized state */
 static void ws_place(Client *c) {
+    int shown;
     if (c->screenspace || !c->mapped) return;
+    shown = c->ws == cur_ws && !c->minimized;
     if (c->frame) {
-        if (c->ws == cur_ws && !c->fullscreen) {
+        if (shown && !c->fullscreen) {
             XMapWindow(dpy, c->frame);
             restack_frame(c);
-        } else if (c->ws != cur_ws) {
+        } else if (!shown) {
             XUnmapWindow(dpy, c->frame);
         }
     }
     c->lx = -99999;             /* force a real re-position */
     apply_geometry(c);
+}
+
+/* minimize: hide the window; it stays listed in the task manager
+ * (Mod+M), where double-clicking it brings it back */
+static void minimize_client(Client *c) {
+    if (!c || c->is_or || c->screenspace || c->minimized) return;
+    c->minimized = 1;
+    ws_place(c);
+    if (c == focused) focus_client(next_client(NULL));
+    skip_enters();
+    dirty = 1;
+}
+
+static void unminimize_client(Client *c) {
+    if (!c || !c->minimized) return;
+    c->minimized = 0;
+    ws_place(c);
+    dirty = 1;
 }
 
 static void switch_ws(int n) {
@@ -2193,6 +2268,7 @@ static void switch_ws(int n) {
         if (eligible(c)) top = c;
     }
     focus_client(top);
+    skip_enters();
     dirty = 1;
 }
 
@@ -2466,7 +2542,10 @@ static void button_press(XButtonEvent *ev) {
                 for (v = clients; v; v = v->next) if (v == t) break;
                 if (v && tm_is_listed(v)) {
                     close_tm();
+                    if (v->ws != cur_ws) switch_ws(v->ws);
+                    unminimize_client(v);
                     fly_to(v);
+                    skip_enters();
                     return;
                 }
             }
@@ -2498,6 +2577,7 @@ static void button_press(XButtonEvent *ev) {
         raise_client(c);
         switch (zone) {
         case HIT_CLOSE: close_client(c); return;
+        case HIT_MIN:   minimize_client(c); return;
         case HIT_MAX:   snap_client(c, SNAP_FULL); return;
         case HIT_TITLE:
             start_drag(c, ev, 1, 0);
@@ -2578,7 +2658,7 @@ static void motion(XMotionEvent *ev) {
             Hit zone = decor_zone(c, ev->x_root, ev->y_root, &edges);
             if (zone == HIT_RESIZE) set_cursor(edge_cursor(edges));
             else set_cursor(cur_norm);
-            if (zone == HIT_CLOSE || zone == HIT_MAX) { nh = c; nhit = zone; }
+            if (zone >= HIT_CLOSE && zone <= HIT_MAX) { nh = c; nhit = zone; }
         } else if (ev->window == root) {
             set_cursor(cur_norm);
         }
