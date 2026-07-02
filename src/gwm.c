@@ -68,6 +68,7 @@
 #include <signal.h>
 #include <math.h>
 #include <dirent.h>
+#include <time.h>
 #include <sys/select.h>
 #include <sys/time.h>
 #include <sys/stat.h>
@@ -200,6 +201,7 @@ static char *bins[MAX_BINS];
 static int nbins = -1;
 static char lhist[LHIST_MAX][256];  /* most-recent-first */
 static int lhist_n;
+static int lsel = -1;               /* arrow-key-selected history row, -1: input */
 
 static Atom A_WM_PROTOCOLS, A_WM_DELETE, A_WM_STATE, A_WM_TAKE_FOCUS,
             A_NET_SUPPORTING, A_NET_WM_NAME, A_NET_ACTIVE, A_UTF8,
@@ -1444,6 +1446,11 @@ static void draw_launcher(void) {
     for (i = 0; i < lhist_n; i++) {
         int ry = LAUNCHER_H + 4 + i * LAUNCHER_HROWH;
         int rty = ry + LAUNCHER_HROWH / 2 + (lfont ? lfont->ascent / 2 : 5);
+        if (i == lsel) {
+            XSetForeground(dpy, lgc, 0x2a2f44);
+            XFillRectangle(dpy, lwin, lgc, 2, ry,
+                           LAUNCHER_W - 4, LAUNCHER_HROWH);
+        }
         XSetForeground(dpy, lgc, COL_LFG);
         XDrawString(dpy, lwin, lgc, tx, rty, lhist[i], (int)strlen(lhist[i]));
         if (i < lhist_n - 1)
@@ -1458,6 +1465,7 @@ static void open_launcher(void) {
     if (lopen) return;
     scan_path();
     ltext[0] = 0;
+    lsel = -1;
     lopen = 1;
     XMapRaised(dpy, lwin);
     raise_panel(lclient, lwin);
@@ -1494,13 +1502,25 @@ static void launcher_key(XKeyEvent *ev) {
     int n = XLookupString(ev, buf, sizeof buf - 1, &ks, NULL);
     size_t len = strlen(ltext);
     if (ks == XK_Escape) { close_launcher(); return; }
+    /* Up/Down walk the history rows below the input; Enter runs the
+     * highlighted row. Any editing key drops back to the input line. */
+    if (ks == XK_Down || ks == XK_Up) {
+        if (ks == XK_Down) { if (lsel < lhist_n - 1) lsel++; }
+        else               { if (lsel >= 0) lsel--; }
+        draw_launcher();
+        return;
+    }
     if (ks == XK_Return) {
         char cmd[300];
-        snprintf(cmd, sizeof cmd, "%s", ltext);
+        if (lsel >= 0 && lsel < lhist_n)
+            snprintf(cmd, sizeof cmd, "%s", lhist[lsel]);
+        else
+            snprintf(cmd, sizeof cmd, "%s", ltext);
         close_launcher();
         if (cmd[0]) { spawn(cmd); add_lhistory(cmd); }
         return;
     }
+    lsel = -1;
     if (ks == XK_Tab) {
         const char *h = completion();
         if (h) snprintf(ltext, sizeof ltext, "%s", h);
@@ -2048,6 +2068,138 @@ static void close_tm(void) {
     dirty = 1;
 }
 
+/* ---- screenshot (PrintScreen) ----------------------------------------- */
+/* Minimal PNG writer: a zlib stream of uncompressed (stored) deflate
+ * blocks, so no image library is needed. Bigger files than a real
+ * encoder, but every viewer reads them. */
+static unsigned long png_crc_tab[256];
+static unsigned long png_crc(unsigned long c, const unsigned char *p, size_t n) {
+    size_t i;
+    if (!png_crc_tab[1]) {
+        unsigned long k;
+        int j;
+        for (i = 0; i < 256; i++) {
+            for (k = i, j = 0; j < 8; j++)
+                k = (k & 1) ? 0xedb88320UL ^ (k >> 1) : k >> 1;
+            png_crc_tab[i] = k;
+        }
+    }
+    for (i = 0; i < n; i++)
+        c = png_crc_tab[(c ^ p[i]) & 0xff] ^ (c >> 8);
+    return c;
+}
+static void png_be32(unsigned char *p, unsigned long v) {
+    p[0] = (unsigned char)(v >> 24); p[1] = (unsigned char)(v >> 16);
+    p[2] = (unsigned char)(v >> 8);  p[3] = (unsigned char)v;
+}
+static void png_chunk(FILE *f, const char *type,
+                      const unsigned char *data, size_t n) {
+    unsigned char b4[4];
+    unsigned long crc;
+    png_be32(b4, (unsigned long)n);
+    fwrite(b4, 1, 4, f);
+    fwrite(type, 1, 4, f);
+    if (n) fwrite(data, 1, n, f);
+    crc = png_crc(0xffffffffUL, (const unsigned char *)type, 4);
+    if (n) crc = png_crc(crc, data, n);
+    png_be32(b4, crc ^ 0xffffffffUL);
+    fwrite(b4, 1, 4, f);
+}
+static int mask_shift(unsigned long m) {
+    int s = 0;
+    if (!m) return 0;
+    while (!(m & 1)) { m >>= 1; s++; }
+    return s;
+}
+
+/* grab the monitor under the pointer and save /tmp/<timestamp>.png */
+static void save_screenshot(void) {
+    static const unsigned char sig[8] =
+        { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
+    Window rr, cr;
+    int rx = 0, ry = 0, wx, wy, x, y;
+    unsigned mm;
+    Mon *m;
+    XImage *img;
+    FILE *f;
+    char fname[128];
+    time_t t = time(NULL);
+    struct tm *lt = localtime(&t);
+    unsigned char hdr[13], *raw, *idat;
+    size_t rawn, ip, off;
+    unsigned long a1 = 1, a2 = 0, rmax, gmax, bmax;
+    int rs, gs, bs;
+
+    XQueryPointer(dpy, root, &rr, &cr, &rx, &ry, &wx, &wy, &mm);
+    m = monitor_at(rx, ry);
+    img = XGetImage(dpy, root, (int)m->x, (int)m->y,
+                    (unsigned)m->w, (unsigned)m->h, AllPlanes, ZPixmap);
+    if (!img) return;
+    strftime(fname, sizeof fname, "/tmp/%Y-%m-%d_%H%M%S.png", lt);
+
+    rs = mask_shift(img->red_mask);   rmax = img->red_mask >> rs;
+    gs = mask_shift(img->green_mask); gmax = img->green_mask >> gs;
+    bs = mask_shift(img->blue_mask);  bmax = img->blue_mask >> bs;
+    if (!rmax) rmax = 1;
+    if (!gmax) gmax = 1;
+    if (!bmax) bmax = 1;
+
+    /* scanlines: filter byte 0 + RGB triples */
+    rawn = (size_t)m->h * (1 + (size_t)m->w * 3);
+    raw = malloc(rawn);
+    idat = malloc(2 + rawn + 5 * (rawn / 65535 + 1) + 4);
+    f = fopen(fname, "wb");
+    if (!raw || !idat || !f) {
+        free(raw); free(idat);
+        if (f) fclose(f);
+        XDestroyImage(img);
+        return;
+    }
+    ip = 0;
+    for (y = 0; y < (int)m->h; y++) {
+        raw[ip++] = 0;
+        for (x = 0; x < (int)m->w; x++) {
+            unsigned long px = XGetPixel(img, x, y);
+            raw[ip++] = (unsigned char)(((px & img->red_mask)   >> rs) * 255 / rmax);
+            raw[ip++] = (unsigned char)(((px & img->green_mask) >> gs) * 255 / gmax);
+            raw[ip++] = (unsigned char)(((px & img->blue_mask)  >> bs) * 255 / bmax);
+        }
+    }
+    XDestroyImage(img);
+
+    /* zlib wrapper + stored deflate blocks + adler32 */
+    idat[0] = 0x78; idat[1] = 0x01; ip = 2;
+    for (off = 0; off < rawn; off += 65535) {
+        size_t blk = rawn - off > 65535 ? 65535 : rawn - off;
+        idat[ip++] = off + blk == rawn;                 /* BFINAL */
+        idat[ip++] = (unsigned char)blk;
+        idat[ip++] = (unsigned char)(blk >> 8);
+        idat[ip++] = (unsigned char)~blk;
+        idat[ip++] = (unsigned char)(~blk >> 8);
+        memcpy(idat + ip, raw + off, blk);
+        ip += blk;
+    }
+    for (off = 0; off < rawn; off++) {
+        a1 = (a1 + raw[off]) % 65521;
+        a2 = (a2 + a1) % 65521;
+    }
+    png_be32(idat + ip, a2 << 16 | a1);
+    ip += 4;
+    free(raw);
+
+    fwrite(sig, 1, 8, f);
+    png_be32(hdr, (unsigned long)m->w);
+    png_be32(hdr + 4, (unsigned long)m->h);
+    hdr[8] = 8;                     /* bit depth   */
+    hdr[9] = 2;                     /* RGB         */
+    hdr[10] = hdr[11] = hdr[12] = 0;
+    png_chunk(f, "IHDR", hdr, 13);
+    png_chunk(f, "IDAT", idat, ip);
+    png_chunk(f, "IEND", NULL, 0);
+    fclose(f);
+    free(idat);
+}
+
 /* ---- key/button grabs ------------------------------------------------ */
 static void grab_key(KeySym ks, unsigned mods) {
     KeyCode kc = XKeysymToKeycode(dpy, ks);
@@ -2075,6 +2227,7 @@ static void setup_grabs(void) {
         grab_key(keys[i], MOD);
         grab_key(keys[i], MOD | ShiftMask);
     }
+    grab_key(XK_Print, 0);          /* PrintScreen, no modifier */
     grab_button(Button1, MOD);
     grab_button(Button3, MOD);
     grab_button(Button4, MOD);
@@ -2119,6 +2272,8 @@ static void key_normal(KeySym ks, unsigned state) {
     case XK_e:
         if (shift) running = 0;
         break;
+    case XK_Print:
+        save_screenshot(); break;
     default: break;
     }
 }
