@@ -19,6 +19,9 @@
  *   Mod+Shift+Up          fullscreen (toggle)
  *   Mod+Shift+Down        restore snapped window
  *   Mod+Tab               cycle focus (pans to the window)
+ *   Mod+1..9              switch workspace (each keeps its own pan/zoom)
+ *   Mod+Shift+1..9        send focused window to workspace
+ *   PrintScreen           screenshot active monitor -> /tmp/<timestamp>.png
  *   Mod+F                 maximize focused window (toggle, = green button)
  *   Mod+Q                 close window
  *   Mod+Shift+E           quit WM
@@ -133,6 +136,7 @@ typedef struct Client {
     int fullscreen;             /* EWMH fullscreen (no decorations)      */
     double fsx, fsy, fsw, fsh;  /* saved geometry for fullscreen restore */
     int mapped;
+    int ws;                     /* workspace this window lives on        */
     int is_or;                  /* override-redirect (menus, tooltips)   */
     int screenspace;            /* rendered in screen coords (launcher)  */
     Pixmap pm;
@@ -167,6 +171,12 @@ static Client *focused;
 /* viewport: world coords of screen origin + zoom; t* are animation targets */
 static double vx, vy, zoom = 1.0;
 static double tvx, tvy, tzoom = 1.0;
+
+/* workspaces: each is its own canvas with a remembered view (Mod+1..9) */
+#define NWS 9
+static int cur_ws;
+static double ws_vx[NWS], ws_vy[NWS];
+static double ws_zoom[NWS] = { 1, 1, 1, 1, 1, 1, 1, 1, 1 };
 static double pcx, pcy;         /* last known pointer position (screen) */
 
 static Pixmap backpm;
@@ -510,9 +520,9 @@ static void restack_frame(Client *c) {
     XConfigureWindow(dpy, c->frame, CWSibling | CWStackMode, &wc);
 }
 
-/* is this a normal, visible, user-facing window? */
+/* is this a normal, visible, user-facing window on the current workspace? */
 static int eligible(Client *c) {
-    return c->mapped && !c->is_or && !c->screenspace;
+    return c->mapped && !c->is_or && !c->screenspace && c->ws == cur_ws;
 }
 
 /* send an ICCCM WM_PROTOCOLS message if the client supports it */
@@ -614,6 +624,7 @@ static void apply_geometry(Client *c) {
     if (c->screenspace) return;
     px = (int)lround(c->x - tvx + anchor_x());
     py = (int)lround(c->y - tvy + anchor_y());
+    if (c->ws != cur_ws) { px = SW + 64; py = SH + 64; }  /* parked */
     pw = (int)fmax(1.0, lround(c->w));
     ph = (int)fmax(1.0, lround(c->h));
     if (px == c->lx && py == c->ly && pw == c->lw && ph == c->lh) return;
@@ -798,6 +809,7 @@ static void manage(Window w, XWindowAttributes *wa) {
     c = calloc(1, sizeof(Client));
     c->win = w;
     c->is_or = wa->override_redirect;
+    c->ws = cur_ws;
     c->lx = c->ly = c->lw = c->lh = -1;
     if (c->is_or) {
         /* pin where it appeared: invert the pointer-anchored layout
@@ -945,7 +957,8 @@ static Client *client_at(double sx_, double sy_) {
     Client *c, *hit = NULL;
     for (c = clients; c; c = c->next) {
         double rx, ry, rw, rh;
-        if (!c->mapped || c->screenspace || c->is_or) continue;
+        if (!c->mapped || c->screenspace || c->is_or || c->ws != cur_ws)
+            continue;
         rx = w2sx(c->x); ry = w2sy(c->y) - TBAR * zoom;
         rw = c->w * zoom; rh = c->h * zoom + TBAR * zoom;
         if (sx_ >= rx && sx_ < rx + rw && sy_ >= ry && sy_ < ry + rh) hit = c;
@@ -1204,6 +1217,7 @@ static void paint(void) {
     for (c = clients; c; c = c->next) {
         int rx, ry, rw, rh;
         if (!c->mapped) continue;
+        if (!c->screenspace && c->ws != cur_ws) continue;
         if (c->screenspace) {
             rx = c->lx; ry = c->ly; rw = c->lw; rh = c->lh;
         } else {
@@ -2068,6 +2082,47 @@ static void close_tm(void) {
     dirty = 1;
 }
 
+/* ---- workspaces (Mod+1..9, Mod+Shift+1..9 sends the window) ----------- */
+/* park/unpark a client's real window and frame for its workspace */
+static void ws_place(Client *c) {
+    if (c->screenspace || !c->mapped) return;
+    if (c->frame) {
+        if (c->ws == cur_ws && !c->fullscreen) {
+            XMapWindow(dpy, c->frame);
+            restack_frame(c);
+        } else if (c->ws != cur_ws) {
+            XUnmapWindow(dpy, c->frame);
+        }
+    }
+    c->lx = -99999;             /* force a real re-position */
+    apply_geometry(c);
+}
+
+static void switch_ws(int n) {
+    Client *c, *top = NULL;
+    if (n < 0 || n >= NWS || n == cur_ws) return;
+    ws_vx[cur_ws] = tvx; ws_vy[cur_ws] = tvy; ws_zoom[cur_ws] = tzoom;
+    cur_ws = n;
+    vx = tvx = ws_vx[n]; vy = tvy = ws_vy[n];   /* jump, don't animate */
+    zoom = tzoom = ws_zoom[n];
+    for (c = clients; c; c = c->next) {
+        ws_place(c);
+        if (eligible(c)) top = c;
+    }
+    focus_client(top);
+    dirty = 1;
+}
+
+static void send_to_ws(Client *c, int n) {
+    if (!c || c->is_or || c->screenspace || n < 0 || n >= NWS ||
+        c->ws == n)
+        return;
+    c->ws = n;
+    ws_place(c);
+    if (c == focused) focus_client(next_client(NULL));
+    dirty = 1;
+}
+
 /* ---- screenshot (PrintScreen) ----------------------------------------- */
 /* Minimal PNG writer: a zlib stream of uncompressed (stored) deflate
  * blocks, so no image library is needed. Bigger files than a real
@@ -2221,7 +2276,8 @@ static void grab_button(unsigned btn, unsigned mods) {
 static void setup_grabs(void) {
     KeySym keys[] = { XK_Left, XK_Right, XK_Up, XK_Down, XK_equal, XK_plus,
                       XK_minus, XK_0, XK_r, XK_q, XK_m, XK_l, XK_f, XK_Return,
-                      XK_Tab, XK_e };
+                      XK_Tab, XK_e, XK_1, XK_2, XK_3, XK_4, XK_5, XK_6,
+                      XK_7, XK_8, XK_9 };
     unsigned i;
     for (i = 0; i < sizeof keys / sizeof keys[0]; i++) {
         grab_key(keys[i], MOD);
@@ -2274,6 +2330,11 @@ static void key_normal(KeySym ks, unsigned state) {
         break;
     case XK_Print:
         save_screenshot(); break;
+    case XK_1: case XK_2: case XK_3: case XK_4: case XK_5:
+    case XK_6: case XK_7: case XK_8: case XK_9:
+        if (shift) send_to_ws(focused, (int)(ks - XK_1));
+        else       switch_ws((int)(ks - XK_1));
+        break;
     default: break;
     }
 }
